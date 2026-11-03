@@ -83,12 +83,15 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 | `take_control` | 获取空闲输入锁，返回 lease |
 | `send_input` | 持有效 lease 原样发送命令、文字或控制键 |
 | `release_control` | 主动释放输入锁，原程序继续运行 |
-| `read_screen` | 读取当前屏幕与光标 |
-| `read_output` | 读取同一保留终端缓冲区，支持等待画面变化 |
-| `read_messages` | 读取发给当前关联任务的保留消息，可只读待收或等待 |
+| `read_screen` | 显式获取受限的当前屏幕快照与光标 |
+| `read_output` | 按任务独立读取当前画面的变化，默认最新优先 |
+| `read_history` | 显式读取普通历史，从最近内容向前分页 |
+| `read_messages` | 从最新消息向前分页，可只读待收或等待 |
 | `acknowledge_messages` | 确认已收到消息，不代表任务完成 |
 
-`read_output` 返回 `mode=terminal_snapshot`。内容变化时返回整个保留缓冲区，不是追加日志；不要把多次快照拼接成历史。`after` 可等待下一次内容变化，等待超时不代表程序已结束，也不会释放锁或重发输入。
+0.6 起不再通过 `read_output` 返回整个保留缓冲区。首次只给当前受限画面，此后返回 `mode=terminal_delta` 的变化行；没有变化时 `lines=[]`。默认最多 4000 文本字符、40 行片段，支持 `maxChars`、`maxLines` 和 `nextCursor` 显式分页，不自动补读积压历史。进入 Vim/top 等备用屏幕时默认观察当前程序画面，旧 Shell 历史须显式调用 `read_history`，从最近处向前获取。用户也可点击“查看历史”，不退出当前程序。详见 [终端读取与预算](docs/terminal-reading.md)。
+
+返回结构为带行位置和片段偏移的 `lines`，不再包含旧版 `chunks` 或整份 `text`。`after` 仅影响等待更新，不能请求无界历史。等待超时不代表程序结束，也不会释放锁或重发输入。客户端升级后需刷新 MCP 工具目录；上下文丢失时主动 `resync=true` 或读取当前屏幕。
 
 普通操作：`read_screen` → `take_control` → `send_input` → 观察／继续交互 → `release_control`。没有自动完成检测、`enable_integration`、`execute_command` 或 `command_status` 接口。
 
@@ -98,7 +101,7 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 
 MCP 标准通知只提示有新消息，正文通过任务身份读取；是否唤醒 Agent 取决于客户端，不能指定 Codex 的 Queue/Steer 模式。客户端忽略通知时，未确认消息会附在后续工具结果中，也能调用 `read_messages` 主动读取。用户可看到“待确认收到／Agent 已确认收到”；已确认消息仍保留，清空后不可再次读取。详见 [消息协议与兼容性](docs/messaging.md)。
 
-消息每会话最多 100 条、每条最多 2000 字符，只保留在本机服务内存。私密时禁止 Agent 接收消息。清空消息只影响消息；“清空全部历史”同时清空终端和消息。重启服务清除所有会话与消息。
+消息每会话最多 100 条、每条最多 2000 字符，只保留在本机服务内存。普通工具仅自动附带最近最多两条、合计 2000 文本字符的待收消息；专用读取默认最多 5 条、4000 字符，用 nextCursor 作为 before 继续取更早消息。私密时禁止 Agent 接收消息。清空消息只影响消息；“清空全部历史”同时清空终端和消息。重启服务清除所有会话与消息。
 
 读取不等于消费：未确认的消息会在后续普通共享终端 MCP 工具调用中重复附带，直到 Agent 显式确认收到。确认后停止自动附带，面板和专用历史工具仍可查看，无需清空历史来避免上下文冗余。只读取待收消息时使用 `read_messages(unreadOnly=true)`。Codex 实测目前应按留言通道使用，不能依赖自动唤醒；详见 [待收与确认规则](docs/messaging.md#待收确认与重复投递)。
 

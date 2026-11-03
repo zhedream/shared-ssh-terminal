@@ -4,6 +4,7 @@ import headless from '@xterm/headless';
 import serialize from '@xterm/addon-serialize';
 import type { Profile } from './profiles.js';
 import type { AgentIdentity } from './agents.js';
+import { TerminalReader, type ReadLimits } from './terminal-reader.js';
 
 export interface Pty {
   write(data: string): void;
@@ -33,6 +34,12 @@ export class Session extends EventEmitter {
   private renderedSequence = 0;
   private renderQueue: Promise<void> = Promise.resolve();
   private closing = false;
+  private reader = new TerminalReader();
+  private bufferVersion = 0;
+  private normalOffset = 0;
+  private normalGeneration = 0;
+  private normalHistoryRevision = 0;
+  private trimMarker?: { marker: { line: number; isDisposed: boolean; dispose(): void }; line: number };
 
   constructor(readonly profile: Profile, readonly pty: Pty, owner: string, creator?: AgentIdentity) {
     super();
@@ -43,6 +50,8 @@ export class Session extends EventEmitter {
     // including its bounded scrollback; there is no raw output log.
     this.terminal = new headless.Terminal({ cols: this.cols, rows: this.rows, scrollback: 2000, allowProposedApi: true });
     this.terminal.loadAddon(this.serializer);
+    this.terminal.buffer.onBufferChange(() => { this.bufferVersion++; });
+    this.trackTrimming();
     this.terminal.parser.registerCsiHandler({ final: 'J' }, params => {
       if (params[0] === 3) this.historyEpoch++;
       return false;
@@ -79,9 +88,12 @@ export class Session extends EventEmitter {
   private output(data: string) {
     const seq = ++this.sequence;
     this.renderQueue = this.renderQueue.then(() => new Promise<void>(resolve => {
+      const wasNormal = this.terminal.buffer.active.type === 'normal';
       this.terminal.write(data, () => {
+        if (wasNormal || String(this.terminal.buffer.active.type) === 'normal') this.normalHistoryRevision++;
+        this.trackTrimming();
         this.renderedSequence = seq;
-        this.emit('output', { data, private: this.privateMode, seq, uiSeq: seq });
+        this.emit('output', { data, private: this.privateMode, seq, uiSeq: seq, normalHistoryRevision: this.normalHistoryRevision });
         this.emit('public-output', seq); resolve();
       });
     }));
@@ -97,7 +109,7 @@ export class Session extends EventEmitter {
     this.ensureOpen();
     this.lock = { kind: 'user', owner, lease: randomUUID() }; this.changed();
   }
-  setPrivacy(privateMode: boolean) { this.privateMode = privateMode; this.changed(); }
+  setPrivacy(privateMode: boolean) { if (this.privateMode !== privateMode) this.reader.invalidate(); this.privateMode = privateMode; this.changed(); }
   setPrivate(_owner: string) { this.setPrivacy(true); }
   releaseUser(owner: string) {
     this.ensureOpen();
@@ -131,13 +143,37 @@ export class Session extends EventEmitter {
     if (agent) this.ensurePublic();
     const epoch = this.historyEpoch;
     const view = this.renderQueue.then(fn);
-    this.renderQueue = view.then(() => {});
+    this.renderQueue = view.then(() => {}, () => {});
     const result = await view;
     if (agent) this.ensurePublic();
     // A clear occurring while a read was pending invalidates its old result.
     if (agent && epoch !== this.historyEpoch) return this.capture(fn, true);
     return result;
   }
+  private trackTrimming() {
+    if (this.trimMarker) {
+      const { marker, line } = this.trimMarker;
+      if (marker.isDisposed || marker.line > line) { this.normalOffset = 0; this.normalGeneration++; }
+      else this.normalOffset += line - marker.line;
+      if (!marker.isDisposed) this.trimMarker.line = marker.line;
+    }
+    if (this.terminal.buffer.active.type === 'normal') {
+      this.trimMarker?.marker.dispose();
+      const marker = this.terminal.registerMarker(0);
+      this.trimMarker = marker ? { marker, line: marker.line } : undefined;
+    }
+  }
+  async observe(owner: string, kind: 'changes' | 'screen' | 'history', options: ReadLimits = {}, agent = true) {
+    return this.capture(() => {
+      const buffer = kind === 'history' ? this.terminal.buffer.normal : this.terminal.buffer.active;
+      const lines = Array.from({ length: buffer.length }, (_, i) => buffer.getLine(i)?.translateToString(true) ?? '');
+      const result = this.reader.read({ lines, buffer: buffer.type, baseY: buffer.baseY, cursorX: buffer.cursorX, cursorY: buffer.cursorY,
+        cols: this.cols, rows: this.rows, sequence: this.renderedSequence, historyEpoch: this.historyEpoch,
+        bufferVersion: this.bufferVersion, normalOffset: this.normalOffset, normalGeneration: this.normalGeneration }, owner, kind, options);
+      return { ...result, activeBuffer: this.terminal.buffer.active.type, normalHistoryRevision: this.normalHistoryRevision };
+    }, agent);
+  }
+  lastReadSequence(owner: string) { return this.reader.lastSequence(owner); }
   async read(after = 0) {
     return this.capture(() => {
       const buffer = this.terminal.buffer.active;
@@ -166,6 +202,7 @@ export class Session extends EventEmitter {
     this.renderQueue = this.renderQueue.then(async () => {
       const alternate = this.terminal.buffer.active.type === 'alternate';
       this.terminal.reset();
+      this.trackTrimming(); this.reader.invalidate(); this.normalHistoryRevision++;
       if (alternate) await new Promise<void>(resolve => this.terminal.write('\x1b[?1049h', resolve));
       this.renderedSequence = seq;
       this.emit('reset', { data: this.serializer.serialize(), seq, uiSeq: seq, cols: this.cols, rows: this.rows });
@@ -178,6 +215,7 @@ export class Session extends EventEmitter {
     const seq = ++this.sequence;
     this.renderQueue = this.renderQueue.then(() => {
       this.terminal.resize(cols, rows); this.renderedSequence = seq;
+      this.trackTrimming(); this.normalHistoryRevision++;
       this.emit('resize', { cols, rows, seq, uiSeq: seq }); this.emit('public-output', seq); this.changed();
     });
   }

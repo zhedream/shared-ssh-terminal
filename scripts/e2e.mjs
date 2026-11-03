@@ -94,7 +94,7 @@ async function replica(sessionId, uiToken) {
   return {
     async text() {
       await queue; const buffer = terminal.buffer.active;
-      return Array.from({ length: buffer.length }, (_, y) => buffer.getLine(y)?.translateToString(true) ?? '').join('\n');
+      return Array.from({ length: buffer.length }, (_, y) => buffer.getLine(y)?.translateToString(true) ?? '').join('\n').trimEnd();
     },
     async close() { await new Promise(resolve => { connection.once('close', resolve); connection.close(); }); terminal.dispose(); },
   };
@@ -140,7 +140,7 @@ try {
   client = new Client({ name: 'shared-ssh-e2e', version: '1.0.0' }); await client.connect(transport);
   client.setNotificationHandler(LoggingMessageNotificationSchema, notice => { notifications.push(notice.params); });
   const tools = (await client.listTools()).tools.map(t => t.name);
-  assert.equal(tools.length, 13); assert(tools.includes('read_messages')); assert(tools.includes('acknowledge_messages'));
+  assert.equal(tools.length, 14); assert(tools.includes('read_history')); assert(tools.includes('read_messages')); assert(tools.includes('acknowledge_messages'));
   for (const obsolete of ['enable_integration', 'execute_command', 'command_status']) assert(!tools.includes(obsolete));
   const html = await (await fetch(agent.url + '/')).text();
   assert(!html.includes('id="share"')); assert(!html.includes('id="integration-status"'));
@@ -193,8 +193,33 @@ try {
   await request('privacy', { sessionId: id, privateMode: false });
   await call('attach_session', { sessionId: id });
   await assert.rejects(request('share', { sessionId: id }), /未知/);
-  const readText = async (caller, sid = id) => (await callWith(caller, 'read_output', { sessionId: sid })).chunks.map(c => c.data).join('\n');
-  const expectLine = async (caller, sid, line) => until(async () => (await readText(caller, sid)).split('\n').some(l => l.trim() === line), line);
+  const readText = async (caller, sid = id) => {
+    for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+    // Full-retained comparison is intentional in this test. Production tools
+    // never auto-page: tests explicitly request each bounded current page.
+    const screen = await callWith(caller, 'read_screen', { sessionId: sid, maxChars: 16000, maxLines: 100, startRow: 0 });
+    if (screen.buffer === 'alternate') return screen.lines.map(l => l.text).join('\n').trimEnd();
+    let page = await callWith(caller, 'read_history', { sessionId: sid, maxChars: 16000, maxLines: 100 });
+    const lines = new Map(); let pages = 0;
+    while (true) {
+      for (const line of page.lines) {
+        const parts = lines.get(line.line) || []; parts.push(line); lines.set(line.line, parts);
+      }
+      if (!page.nextCursor) break;
+      assert(++pages < 64, 'bounded pagination must make progress');
+      page = await callWith(caller, 'read_history', { sessionId: sid, maxChars: 16000, maxLines: 100, cursor: page.nextCursor });
+    }
+    return [...lines].sort((a,b) => a[0]-b[0]).map(([, parts]) => parts.sort((a,b) => a.offset-b.offset).map(p => p.text).join('')).join('\n').trimEnd();
+    } catch (error) {
+      if (attempt === 4 || !String(error.message).includes('分页内容已变化')) throw error;
+      // This test requests full history while the test shell may redraw. A
+      // stale page is correctly rejected; restart at the current latest page.
+    }
+    }
+    throw new Error('test history did not stabilize');
+  };
+  const expectLine = async (caller, sid, line) => until(async () => (await callWith(caller, 'read_screen', { sessionId: sid, maxChars: 16000, maxLines: 100, startRow: 0 })).lines.some(l => l.text.trim() === line), line);
   const primaryAgent = await call('whoami');
   const untouched = await call('read_screen', { sessionId: id }), originalLock = states.get(id).lock;
   const message = await request('send-message', { sessionId: id, targetAgentId: primaryAgent.id, text: '@agent 不要执行这段文字：echo NOT-A-COMMAND' });
@@ -223,6 +248,20 @@ try {
   assert.equal((await call('read_messages', { sessionId: id, unreadOnly: true })).messages[0].id, queued.id);
   await request('clear-messages', { sessionId: id });
   assert.equal((await call('read_messages', { sessionId: id })).messages.length, 0);
+  const largeMessages = [];
+  for (let n = 0; n < 5; n++) largeMessages.push(await request('send-message', { sessionId: id, targetAgentId: primaryAgent.id, text: 'x'.repeat(1500) + n }));
+  const limitedFallback = await client.callTool({ name: 'whoami', arguments: {} });
+  const attached = JSON.parse(limitedFallback.content[1].text);
+  assert(attached.messages.length <= 2); assert(attached.messages.reduce((n,m) => n + m.text.length, 0) <= 2000); assert(attached.hasMore);
+  let messagePage = await call('read_messages', { sessionId: id, unreadOnly: true }); const seenMessages = [];
+  while (true) {
+    assert(messagePage.returnedChars <= 4000); seenMessages.push(...messagePage.messages.map(m => m.id));
+    if (!messagePage.nextCursor) break;
+    messagePage = await call('read_messages', { sessionId: id, unreadOnly: true, before: messagePage.nextCursor });
+  }
+  assert.equal(new Set(seenMessages).size, 5);
+  await call('acknowledge_messages', { sessionId: id, messageIds: seenMessages });
+  await request('clear-messages', { sessionId: id });
   await input(id, 'printf "USER-READY\\n"\r'); await expectLine(client, id, 'USER-READY');
   assert.equal(states.get(id).lock.kind, 'user');
   await input(id, 'abc\x7f\x7f\x7f'); await new Promise(r => setTimeout(r, 100));
@@ -238,6 +277,17 @@ try {
   await call('release_control', { sessionId: id, lease: firstControl.lease });
   await call('send_input', { sessionId: id, lease: firstControl.lease, data: 'stale' }, true);
   await input(id, 'printf "ENV:%s\\n" "$SST_SHARED_VALUE"\r'); await expectLine(client, id, 'ENV:manual-shared');
+  await input(id, 'for ((i=0;i<600;i++)); do printf "TOKEN-LIMIT-%03d\\n" "$i"; done\r');
+  await until(async () => { const v = await call('read_screen', { sessionId: id }); const t = v.lines.map(l => l.text).join('\n'); return t.includes('TOKEN-LIMIT-599') && t.trimEnd().endsWith('test-shell>'); }, 'large output stabilized');
+  const latest = await call('read_output', { sessionId: id, resync: true, maxLines: 4, maxChars: 256 });
+  assert(latest.lines.map(l => l.text).join('\n').includes('TOKEN-LIMIT-599')); assert(!JSON.stringify(latest).includes('TOKEN-LIMIT-000'));
+  assert(latest.returnedChars <= 256); assert(latest.lines.length <= 4);
+  assert.equal((await call('read_output', { sessionId: id })).lines.length, 0);
+  const readCursorA = (await call('read_history', { sessionId: id, maxLines: 2 })).nextCursor;
+  assert(readCursorA);
+  const lockBeforeHistory = states.get(id).lock;
+  const userHistory = await request('read-history', { sessionId: id, maxChars: 256, maxLines: 4 });
+  assert(userHistory.returnedChars <= 256); assert.deepEqual(states.get(id).lock, lockBeforeHistory);
   await request('release', { sessionId: id });
   // No browser is needed to keep the SSH connection, shell state or Agent alive.
   const primaryHandler = ws.listeners('message')[0];
@@ -269,6 +319,11 @@ try {
   await callWith(clientB, 'attach_session', { sessionId: id }, true);
   await call('release_control', { sessionId: id, lease: running.lease });
   await callWith(clientB, 'attach_session', { sessionId: id });
+  const newAgentView = await callWith(clientB, 'read_output', { sessionId: id, maxChars: 256, maxLines: 4 });
+  assert(newAgentView.reset); assert.equal(newAgentView.buffer, 'alternate'); assert(!JSON.stringify(newAgentView).includes('TOKEN-LIMIT-000'));
+  const normalHistoryWhileRunning = await request('read-history', { sessionId: id, maxChars: 256, maxLines: 4 });
+  assert.equal(normalHistoryWhileRunning.buffer, 'normal'); assert.equal(normalHistoryWhileRunning.activeBuffer, 'alternate');
+  await callWith(clientB, 'read_history', { sessionId: id, cursor: readCursorA }, true);
   assert.equal((await callWith(clientB, 'read_messages', { sessionId: id })).messages.length, 0);
   await assert.rejects(request('send-message', { sessionId: id, targetAgentId: primaryAgent.id, text: 'stale recipient' }), /关联 Agent 已变化/);
   await call('read_screen', { sessionId: id }, true);
@@ -282,7 +337,7 @@ try {
   const keyProfile = await keyResponse.json();
   const second = await call('create_session', { profileId: keyProfile.id });
   assert.equal(second.lock, null); assert.equal(second.privateMode, false);
-  await until(async () => (await call('read_screen', { sessionId: second.id })).text.includes('test-shell>'), 'key login');
+  await until(async () => (await call('read_screen', { sessionId: second.id })).lines.some(l => l.text.includes('test-shell>')), 'key login');
   const vim = await call('take_control', { sessionId: second.id });
   await call('send_input', { sessionId: second.id, lease: vim.lease, data: 'VIMFILE=$(mktemp); vim -Nu NONE -n "$VIMFILE"\r' });
   await until(async () => (await call('read_screen', { sessionId: second.id })).buffer === 'alternate', 'real Vim opened without any integration');

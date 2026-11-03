@@ -48,3 +48,18 @@ test('message sending is independent of the input lock and disabled for privacy,
   context.ready = false; check(true); context.ready = true;
   context.messageSending = true; check(true); assert.equal($('message-text').disabled, true);
 });
+test('a pending history response cannot redisplay cleared content in the user dialog', async () => {
+  const source = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
+  const invalidate = source.slice(source.indexOf('function invalidateHistory('), source.indexOf('const dismissedStorageKey'));
+  const load = source.slice(source.indexOf('async function loadHistory('), source.indexOf("$('view-history').addEventListener"));
+  const nodes = new Map<string, any>();
+  const $ = (id: string) => { if (!nodes.has(id)) nodes.set(id, { textContent: '', disabled: false }); return nodes.get(id); };
+  let finish: (value: any) => void = () => {};
+  const context: any = { $, ready: true, historySessionId: 'one', historyCursor: null, historyBusy: false, historyRequest: 0,
+    normalHistoryRevisions: new Map(), request: () => new Promise(resolve => { finish = resolve; }) };
+  runInNewContext(invalidate + load + '\nvar pendingHistory = loadHistory();', context);
+  runInNewContext("invalidateHistory('历史已清空');", context);
+  finish({ lines: [{ line: 0, offset: 0, text: 'OLD-CLEARED-TEXT' }], nextCursor: null, normalHistoryRevision: 1, returnedChars: 16, hasMore: false, activeBuffer: 'normal' });
+  await context.pendingHistory;
+  assert.equal($('history-text').textContent, ''); assert.equal($('history-status').textContent, '历史已清空');
+});

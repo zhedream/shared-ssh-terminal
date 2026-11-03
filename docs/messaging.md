@@ -18,9 +18,9 @@
 
 ## MCP 工具
 
-- `read_messages({agentId, sessionId, unreadOnly?, waitMs?})`：默认返回当前目标的保留历史。`unreadOnly=true` 只读待确认消息；没有符合条件的消息时可等待，最长 15 秒。
+- `read_messages({agentId, sessionId, unreadOnly?, waitMs?, maxMessages?, maxChars?, before?})`：默认从最近消息向旧消息读取，最多 5 条、4000 文本字符。`maxMessages` 上限 20；`maxChars` 范围 2000–16000，保证单条消息能完整返回，不截断后诱导误确认。使用 nextCursor 作为 before 读取更早页。`unreadOnly=true` 只读待确认消息；没有符合条件的消息时可等待，最长 15 秒。
 - `acknowledge_messages({agentId, sessionId, messageIds})`：显式确认收到，校验每条消息的目标及会话。幂等确认不代表任务执行完成。
-- 其余工具的主结果结构保持原样。当有未确认消息时，在工具结果的额外文本块中附带 `type=user_messages`。客户端不展示通知时，Agent 下次工具调用仍能读取。
+- 其余工具的主结果结构保持原样。当有未确认消息时，在额外文本块中附带 `type=user_messages`，最近优先，最多两条且正文合计不超过 2000 字符。返回 totalMessages/hasMore 提示积压，更多内容用专用工具显式分页。消息正文不重复附带接收者项目路径、任务说明等长元数据。
 
 ## 待收、确认与重复投递
 
@@ -33,7 +33,7 @@
 | Agent 调用 acknowledge_messages | 不再自动附带已确认消息 | 仍可读 | Agent 已确认收到 |
 | 用户清空消息或移除页签 | 不再附带 | 无法再次读取已清内容 | 历史移除 |
 
-例如消息 M1、M2 已确认，随后用户发送 M3、M4，下一次普通工具返回只附带 M3、M4，不重复附带 M1、M2。若只确认 M3，之后仍会附带 M4，直到它也被确认或被用户清空。这是允许重复投递、依靠显式确认完成消费的语义，不是“恰好一次”投递。
+例如消息 M1、M2 已确认，随后用户发送 M3、M4，在合计正文不超过预算时，下一次普通工具返回附带 M4、M3，不重复附带 M1、M2。预算不足时只附带能完整容纳的最近消息，并提示尚有更多。若只确认 M3，后续 M4 仍处于待收集合，直到确认或清空。这是允许重复投递、依靠显式确认消费的语义，不是“恰好一次”投递。
 
 自动附带的范围仅限这个共享终端 MCP 的普通成功工具调用，例如 whoami、list_sessions、read_screen、send_input。它不会附在其他 MCP、Web 搜索、本地命令工具或下一条 Codex 聊天消息上。附带消息可以来自当前任务关联的多个会话，但只包含目标是当前任务、当前仍有关联且未开启私密的消息。
 

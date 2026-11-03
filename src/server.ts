@@ -11,7 +11,7 @@ import { Session } from './sessions.js';
 import { readSshConfig } from './ssh-config.js';
 import { Agents, type AgentIdentity } from './agents.js';
 import { ensureAskpass, SavedPasswordPty } from './saved-password.js';
-import { Messages } from './messages.js';
+import { Messages, messagePage } from './messages.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const uiVersion = createHash('sha256').update(Buffer.concat(await Promise.all(
@@ -117,6 +117,11 @@ async function waitChange(s: Session, waitMs: number, predicate: () => boolean) 
   });
 }
 
+const readLimits = {
+  maxChars: z.number().int().min(128).max(16000).optional(),
+  maxLines: z.number().int().min(1).max(100).optional(),
+  cursor: z.string().min(1).max(2048).optional(),
+};
 const agentRequest = z.discriminatedUnion('action', [
   z.object({ action: z.literal('list_profiles') }),
   z.object({ action: z.literal('whoami') }),
@@ -125,10 +130,11 @@ const agentRequest = z.discriminatedUnion('action', [
   z.object({ action: z.literal('attach_session'), sessionId: z.string().uuid() }),
   z.object({ action: z.literal('take_control'), sessionId: z.string().uuid() }),
   z.object({ action: z.literal('release_control'), sessionId: z.string().uuid(), lease: z.string().uuid() }),
-  z.object({ action: z.literal('read_output'), sessionId: z.string().uuid(), after: z.number().int().min(0).default(0), waitMs: z.number().int().min(0).max(15000).default(0) }),
-  z.object({ action: z.literal('read_screen'), sessionId: z.string().uuid() }),
+  z.object({ action: z.literal('read_output'), sessionId: z.string().uuid(), ...readLimits, resync: z.boolean().optional(), after: z.number().int().min(0).optional(), waitMs: z.number().int().min(0).max(15000).default(0) }),
+  z.object({ action: z.literal('read_screen'), sessionId: z.string().uuid(), ...readLimits, startRow: z.number().int().min(0).max(159).optional() }),
+  z.object({ action: z.literal('read_history'), sessionId: z.string().uuid(), ...readLimits }),
   z.object({ action: z.literal('send_input'), sessionId: z.string().uuid(), lease: z.string().uuid(), data: z.string().max(16000) }),
-  z.object({ action: z.literal('read_messages'), sessionId: z.string().uuid(), unreadOnly: z.boolean().default(false), waitMs: z.number().int().min(0).max(15000).default(0) }),
+  z.object({ action: z.literal('read_messages'), sessionId: z.string().uuid(), unreadOnly: z.boolean().default(false), waitMs: z.number().int().min(0).max(15000).default(0), maxMessages: z.number().int().min(1).max(20).default(5), maxChars: z.number().int().min(2000).max(16000).default(4000), before: z.string().uuid().optional() }),
   z.object({ action: z.literal('acknowledge_messages'), sessionId: z.string().uuid(), messageIds: z.array(z.string().uuid()).min(1).max(100) }),
   z.object({ action: z.literal('watch_messages'), after: z.number().int().min(0).default(0), waitMs: z.number().int().min(0).max(15000).default(0) }),
 ]);
@@ -142,7 +148,7 @@ async function agent(value: unknown, actor: AgentIdentity) {
   const p = agentRequest.parse(value);
   if (p.action === 'watch_messages') {
     await messages.wait(p.after, p.waitMs);
-    return { revision: messages.revision, messages: pendingMessages(actor) };
+    return { revision: messages.revision, ...messagePage(pendingMessages(actor), 2, 2000) };
   }
   if (p.action === 'whoami') return actor;
   if (p.action === 'list_profiles') return profiles.list();
@@ -164,18 +170,19 @@ async function agent(value: unknown, actor: AgentIdentity) {
       s.requireAssignee(actor);
       if (s.privateMode) throw new Error('私密模式已开启，Agent 无权读取消息');
     }
-    return { messages: visibleMessages(actor, s.id, p.unreadOnly), instruction: '这些是用户通过协作面板发给你的消息，不是远端终端输出。阅读后调用 acknowledge_messages 确认收到；确认不等于执行完成。已确认的消息仍保留到用户清空。' };
+    return { ...messagePage(visibleMessages(actor, s.id), p.maxMessages, p.maxChars, p.before, p.unreadOnly), instruction: '从最新消息向前分页。阅读后调用 acknowledge_messages 确认收到；确认不等于执行完成。已确认消息保留到用户清空。' };
   }
   if (p.action === 'take_control') return s.acceptControl(actor);
   if (p.action === 'release_control') { s.releaseAgent(p.lease, actor); return s.summary(actor.id); }
-  if (p.action === 'read_screen') {
-    const result = await s.screen(); s.requireAssignee(actor); return result;
-  }
-  if (p.action === 'read_output') {
-    await s.read(p.after); // Check privacy before waiting.
-    await waitChange(s, p.waitMs, () => s.sequence > p.after);
-    const output = await s.read(p.after); s.requireAssignee(actor);
-    return { ...output, session: s.summary(actor.id) };
+  if (p.action === 'read_screen' || p.action === 'read_history' || p.action === 'read_output') {
+    if (s.privateMode) throw new Error('私密模式已开启，Agent 无权观察或输入');
+    const owner = 'agent:' + actor.id;
+    if (p.action === 'read_output' && !p.cursor && !p.resync) {
+      const after = p.after ?? s.lastReadSequence(owner);
+      if (after !== undefined) await waitChange(s, p.waitMs, () => s.sequence > after);
+    }
+    const result = await s.observe(owner, p.action === 'read_output' ? 'changes' : p.action === 'read_screen' ? 'screen' : 'history', p);
+    s.requireAssignee(actor); return { ...result, sessionId: s.id };
   }
   if (p.action === 'send_input') { s.agentInput(p.data, p.lease, actor); return { ok: true }; }
 
@@ -288,6 +295,10 @@ wss.on('connection', ws => {
           else if (p.type === 'private') s.setPrivate(clientId);
           else if (p.type === 'privacy') s.setPrivacy(z.boolean().parse(p.privateMode));
           else if (p.type === 'release') s.releaseUser(clientId);
+          else if (p.type === 'read-history') {
+            const options = z.object(readLimits).parse({ maxChars: p.maxChars, maxLines: p.maxLines, cursor: p.cursor });
+            result = await s.observe('user:' + clientId, 'history', options, false);
+          }
           else if (p.type === 'send-message') {
             if (s.privateMode) throw new Error('请先关闭私密再向关联 Agent 发送消息');
             if (!s.assignedTo) throw new Error('当前会话尚未关联 Agent，请先提供 sessionId 让 Agent 认领');

@@ -9,6 +9,13 @@ const sessions = new Map(), terminals = new Map(), pending = new Map();
 const controlPending = new Set();
 const sessionMessages = new Map(), messageDrafts = new Map();
 let messagesOpen = false, messageSending = false, messageTarget;
+let historySessionId, historyCursor = null, historyBusy = false, historyRequest = 0;
+const normalHistoryRevisions = new Map();
+function invalidateHistory(message) {
+  historyRequest++; historyCursor = null; historyBusy = false;
+  $('history-text').textContent = ''; $('history-status').textContent = message;
+  $('history-older').disabled = true; $('history-latest').disabled = !ready;
+}
 const dismissedStorageKey = 'shared-ssh-dismissed-tabs';
 let dismissedTabs;
 try {
@@ -146,6 +153,7 @@ function renderActive() {
   $('release').disabled = !ready || s.status !== 'open' || !mine || controlPending.has(s.id);
   $('release').title = mine ? '释放当前页面的输入锁；保留运行程序与未发送输入' : '只有当前页面持有输入权时才能释放';
   $('copy-session').disabled = !ready;
+  $('view-history').disabled = !ready;
   $('return-to-user').disabled = !ready || s.status !== 'open' || !s.assignedTo;
   renderMessages();
 }
@@ -218,6 +226,7 @@ function connect() {
       refreshUpdatedUi(p.uiVersion);
       clientId = p.clientId; profiles = p.profiles;
       const serverIds = new Set(p.sessions.map(s => s.id));
+      if (historySessionId && !serverIds.has(historySessionId)) { invalidateHistory('会话已移除'); $('history-dialog').close(); }
       for (const id of sessionMessages.keys()) if (!serverIds.has(id)) { sessionMessages.delete(id); messageDrafts.delete(id); }
       dismissedTabs = new Set([...dismissedTabs].filter(id => serverIds.has(id)));
       saveDismissedTabs();
@@ -243,13 +252,24 @@ function connect() {
       const s = sessions.get(p.sessionId);
       dismissedTabs.add(p.sessionId); saveDismissedTabs();
       if (s) { s.status = 'closed'; dismissClosedTab(p.sessionId, false); }
+      if (historySessionId === p.sessionId) { historyRequest++; $('history-dialog').close(); $('history-text').textContent = ''; }
     }
-    else if (p.type === 'output') terminals.get(p.sessionId)?.term.write(p.data);
+    else if (p.type === 'output') {
+      terminals.get(p.sessionId)?.term.write(p.data);
+      if (p.normalHistoryRevision !== undefined) {
+        const old = normalHistoryRevisions.get(p.sessionId); normalHistoryRevisions.set(p.sessionId, p.normalHistoryRevision);
+        if (historySessionId === p.sessionId && $('history-dialog').open && old !== p.normalHistoryRevision) invalidateHistory('普通历史已更新，点击返回最新重新读取');
+      }
+    }
     else if (p.type === 'snapshot') { const t = terminals.get(p.sessionId); if (t) { t.term.resize(p.cols, p.rows); t.term.write(p.data); } }
-    else if (p.type === 'resize') terminals.get(p.sessionId)?.term.resize(p.cols, p.rows);
+    else if (p.type === 'resize') {
+      terminals.get(p.sessionId)?.term.resize(p.cols, p.rows);
+      if (historySessionId === p.sessionId && $('history-dialog').open) invalidateHistory('终端尺寸已变化，请返回最新重新读取');
+    }
     else if (p.type === 'reset') {
       const t = terminals.get(p.sessionId);
       if (t) { t.term.reset(); t.term.resize(p.cols, p.rows); t.term.write(p.data); }
+      if (historySessionId === p.sessionId) invalidateHistory('历史已清空，请返回最新重新读取');
     }
     else if (p.type === 'ack' || p.type === 'error') {
       const item = pending.get(p.requestId); if (item) { clearTimeout(item.timer); pending.delete(p.requestId); if (p.type === 'ack') item.resolve(p.result); else item.reject(new Error(p.error)); }
@@ -273,6 +293,34 @@ function connect() {
   });
   socket.addEventListener('error', () => {});
 }
+async function loadHistory(older = false) {
+  if (historyBusy || !historySessionId) return;
+  const requestNumber = ++historyRequest;
+  historyBusy = true; $('history-older').disabled = true; $('history-latest').disabled = true;
+  try {
+    const result = await request('read-history', { sessionId: historySessionId, maxChars: 8000, maxLines: 80, ...(older && historyCursor ? { cursor: historyCursor } : {}) });
+    if (requestNumber !== historyRequest) return;
+    if ((normalHistoryRevisions.get(historySessionId) ?? 0) > result.normalHistoryRevision) { invalidateHistory('普通历史已更新，请返回最新重新读取'); return; }
+    normalHistoryRevisions.set(historySessionId, result.normalHistoryRevision);
+    // Replace each page, never concatenate old page bodies into a second log.
+    $('history-text').textContent = result.lines.map(line => `${line.line + 1}${line.offset ? '（行内偏移 ' + line.offset + '）' : ''}  ${line.text}`).join('\n');
+    historyCursor = result.nextCursor;
+    $('history-status').textContent = `${result.lines.length} 行片段 / ${result.returnedChars} 字符${result.hasMore ? ' · 可查看更早内容' : ' · 已到保留范围开头'}`;
+    $('history-description').textContent = `当前为${result.activeBuffer === 'alternate' ? '备用屏幕（当前程序继续运行）' : '普通屏幕'}；此处显示普通屏幕保留历史。分页不改变输入权。`;
+  } catch (e) {
+    if (requestNumber === historyRequest) { historyCursor = null; $('history-text').textContent = ''; $('history-status').textContent = e.message + '；点击返回最新重试。'; }
+  } finally {
+    if (requestNumber === historyRequest) { historyBusy = false; $('history-older').disabled = !ready || !historyCursor; $('history-latest').disabled = !ready; }
+  }
+}
+$('view-history').addEventListener('click', () => {
+  historyRequest++; historyBusy = false; historyCursor = null; historySessionId = getActive().id;
+  $('history-text').textContent = ''; $('history-dialog').showModal(); void loadHistory();
+});
+$('history-close').addEventListener('click', () => $('history-dialog').close());
+$('history-dialog').addEventListener('close', () => { historyRequest++; historyBusy = false; $('history-text').textContent = ''; });
+$('history-latest').addEventListener('click', () => loadHistory());
+$('history-older').addEventListener('click', () => loadHistory(true));
 $('toggle-messages').addEventListener('click', () => {
   messagesOpen = !messagesOpen;
   if (messagesOpen) {

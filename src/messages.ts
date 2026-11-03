@@ -6,6 +6,26 @@ export type UserMessage = {
   id: string; sessionId: string; target: AgentIdentity; source: 'user';
   text: string; createdAt: string; acknowledgedAt?: string;
 };
+export function messagePage(rows: UserMessage[], maxMessages = 5, maxChars = 4000, before?: string, unreadOnly = false) {
+  const sorted = rows.slice().reverse();
+  let start = 0;
+  if (before) {
+    const found = sorted.findIndex(m => m.id === before);
+    if (found < 0) throw new Error('消息分页游标已失效或不属于当前可读范围，请重新读取最新消息');
+    start = found + 1;
+  }
+  const eligible = sorted.slice(start).filter(m => !unreadOnly || !m.acknowledgedAt);
+  const selected: UserMessage[] = []; let chars = 0;
+  for (const row of eligible) {
+    if (selected.length >= maxMessages || chars + row.text.length + (selected.length ? 1 : 0) > maxChars) break;
+    chars += row.text.length + (selected.length ? 1 : 0); selected.push(row);
+  }
+  const hasMore = selected.length < eligible.length;
+  return {
+    messages: selected.map(({ id, sessionId, source, text, createdAt, acknowledgedAt }) => ({ id, sessionId, source, text, createdAt, acknowledgedAt })),
+    totalMessages: rows.filter(m => !unreadOnly || !m.acknowledgedAt).length, returnedChars: chars, hasMore, nextCursor: hasMore ? selected.at(-1)?.id ?? null : null,
+  };
+}
 export class Messages extends EventEmitter {
   private items = new Map<string, UserMessage[]>();
   revision = 0;

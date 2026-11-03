@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Messages } from '../src/messages.js';
+import { Messages, messagePage } from '../src/messages.js';
 const a = { id: 'A', name: 'Agent A', application: 'test', project: 'project-A', task: 'task-A' };
 const b = { ...a, id: 'B', name: 'Agent B' };
 
@@ -31,4 +31,17 @@ test('bounded history refuses additional messages instead of silently hiding una
   const inbox = new Messages(); for (let i = 0; i < 100; i++) inbox.send('one', a, String(i));
   assert.throws(() => inbox.send('one', a, 'overflow'), /100/);
   assert.equal(inbox.list('one').length, 100); inbox.clear('one'); assert.equal(inbox.list('one').length, 0);
+});
+test('message pages prioritize latest, obey length/count budgets, and keep acknowledgment separate from reading', () => {
+  const inbox = new Messages();
+  const first = inbox.send('one', a, 'old'.repeat(500)); const second = inbox.send('one', a, 'new'.repeat(500));
+  const page = messagePage(inbox.read(a.id, () => true), 2, 2000);
+  assert.equal(page.messages.length, 1); assert.equal(page.messages[0].id, second.id); assert.equal(page.nextCursor, second.id);
+  assert(page.returnedChars <= 2000); assert(!('target' in page.messages[0]));
+  const older = messagePage(inbox.read(a.id, () => true), 2, 2000, page.nextCursor!); assert.equal(older.messages[0].id, first.id);
+  assert.equal(inbox.unread(a.id, () => true).length, 2);
+  inbox.acknowledge(a.id, 'one', [second.id]);
+  const afterAck = messagePage(inbox.read(a.id, () => true), 2, 2000, page.nextCursor!, true);
+  assert.equal(afterAck.messages[0].id, first.id);
+  inbox.clear('one'); assert.throws(() => messagePage(inbox.read(a.id, () => true), 2, 2000, page.nextCursor!), /失效/);
 });
