@@ -8,7 +8,9 @@ Agent 应用 B ── stdio MCP ── 适配进程 B ─┼── HTTP ── �
 用户浏览器页面 1/2 ──────────────────────┘     HTTP + WebSocket
 ```
 
-单例服务默认仅监听 `127.0.0.1:43127`，持有所有 SSH 和状态。每个 MCP 应用启动自己的 stdio 适配进程，适配进程不监听新端口。`.runtime/connection.json` 供适配进程发现服务地址，避免各项目硬编码独立端口。
+每个运行目录对应一个后台实例，实例持有所有 SSH 和状态。默认优先绑定 `127.0.0.1:43127`，占用时申请系统分配的 IPv4 回环端口。各 MCP 客户端启动自己的 stdio 适配进程，与 CLI 共用本机服务发现和就绪检查。路径默认从用户目录计算，可通过环境覆盖。[本机配置与旧目录](development.md#本机配置与旧目录)
+
+服务持有按实际运行目录区分的操作系统锁，进程退出时自动释放。Windows 使用命名管道。监听后以同目录临时文件和原子重命名发布 `ui.json`、`connection.json`。发现文件含 `url`、`agentToken`、`pid`、`address` 和 `port`。客户端用认证探测核对服务类型、运行目录标识、PID 和实际监听地址，再进行复用或停止。对来源不明的 `owner.json` 或仍活着的旧进程，程序提示先核对原入口或换独立目录。
 
 浏览器负责显示及人工输入，MCP 负责结构化工具调用。两种入口最终访问同一 Session；消息是独立的本机服务数据，不经过远端。
 
@@ -28,9 +30,9 @@ MCP 读取不再复用浏览器完整恢复快照。TerminalReader 为每个任�
 
 ## 本机认证
 
-服务启动时生成不同的 UI 和 MCP bearer token。浏览器入口中的令牌经验证后保存在本机浏览器，地址栏 hash 被移除。HTTP 检查 Host、Origin 和 bearer；WebSocket 限制同源并在握手后验证令牌。
+服务启动时生成不同的 UI 和 MCP bearer token。浏览器入口中的令牌经验证后保存在本机浏览器，地址栏 hash 被移除。HTTP 和 WebSocket 都按实际端口接受 `127.0.0.1` 与 `localhost`，浏览器 Origin 必须匹配请求 Host。无 Origin 的本机 HTTP 客户端仍可走各自鉴权。WebSocket 要求同源 Origin 和 UI token 握手。CLI 状态与后台日志只输出公开运行信息。
 
-MCP 适配进程为每个项目/聊天 `register_agent`，产生独立任务 ID 和 secret。服务端绑定身份与 secret，不能仅凭可见名称冒充。连接重启时适配进程会向新服务重新注册，但不会恢复已结束的 SSH。
+MCP 适配进程为每个项目/聊天 `register_agent`，产生独立任务 ID 和 secret。服务端按任务身份和 secret 认证。服务重启时，适配进程向新实例重新注册，已经发出的用户动作最多发送一次。旧 SSH 连接随原进程结束。
 
 ## SSH 配置与密码
 

@@ -1,7 +1,7 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFile, mkdir, unlink, open } from 'node:fs/promises';
+import { readFile, mkdir, unlink } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import * as pty from 'node-pty';
@@ -12,17 +12,18 @@ import { readSshConfig } from './ssh-config.js';
 import { Agents, type AgentIdentity } from './agents.js';
 import { ensureAskpass, SavedPasswordPty } from './saved-password.js';
 import { Messages, messagePage } from './messages.js';
-import { listenLocal, localRequestOrigin, preferredLocalPort, writeRuntimeJson } from './local-network.js';
+import { listenLocal, localRequestOrigin, writeRuntimeJson } from './local-network.js';
+import { installRoot as ROOT, servicePaths } from './paths.js';
+import { acquireServiceLock, configuredPort, RuntimeError, runtimeErrorMessage, SERVICE_BUSY, SERVICE_NAME } from './service-runtime.js';
 
-export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const uiVersion = createHash('sha256').update(Buffer.concat(await Promise.all(
   ['public/index.html', 'public/app.js', 'public/app.css'].map(file => readFile(path.join(ROOT, file)))
 ))).digest('hex').slice(0, 16);
-const DATA = process.env.SHARED_SSH_DATA_DIR || path.join(ROOT, 'data');
-const RUNTIME = process.env.SHARED_SSH_RUNTIME_DIR || path.join(ROOT, '.runtime');
-const ownerFile = path.join(RUNTIME, 'owner.json');
-const connectionFile = path.join(RUNTIME, 'connection.json');
-const uiFile = path.join(RUNTIME, 'ui.json');
+const paths = servicePaths();
+const { data: DATA, runtime: RUNTIME } = paths;
+let serviceLock: Awaited<ReturnType<typeof acquireServiceLock>>;
+let instance: { service: string; runtime: string; pid: number; address: string; port: number } | undefined;
+class ServiceBusy extends Error {}
 const token = () => randomBytes(32).toString('hex');
 const uiToken = token(), agentToken = token();
 const equal = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -72,7 +73,10 @@ async function createSession(profileId: string, owner: string, creator?: AgentId
   try {
     const profile = profiles.get(profileId);
     const args = sshArgs(profile);
-    args.splice(args.length - 2, 0, '-o', `UserKnownHostsFile=${path.join(DATA, 'known_hosts')}`);
+    // OpenSSH parses the value of -o as config text, even when argv is already
+    // separated. Quote the path so a directory name can contain spaces.
+    const knownHosts = path.join(DATA, 'known_hosts').split(path.sep).join('/').replaceAll('"', '\\"');
+    args.splice(args.length - 2, 0, '-o', `UserKnownHostsFile="${knownHosts}"`);
     let askpassEnv = {};
     let workingDirectory = ROOT;
     if (profile.savePassword) {
@@ -81,10 +85,10 @@ async function createSession(profileId: string, owner: string, creator?: AgentId
       const password = await profiles.password(profile.id);
       const helper = await ensureAskpass(ROOT, RUNTIME);
       saved = new SavedPasswordPty(profile, password);
-      // Use an ASCII basename in the inherited working directory: Windows
-      // OpenSSH askpass path handling varies for spaces and non-ASCII paths.
+      // Keep the helper path relative to the inherited working directory so its
+      // argument stays ASCII. OpenSSH must not search PATH for a bare filename.
       workingDirectory = path.dirname(helper);
-      askpassEnv = { ...await saved.listen(), SSH_ASKPASS: path.basename(helper), SSH_ASKPASS_REQUIRE: 'force' };
+      askpassEnv = { ...await saved.listen(), SSH_ASKPASS: `.\\${path.basename(helper)}`, SSH_ASKPASS_REQUIRE: 'force' };
     }
     if (shuttingDown) throw new Error('服务正在停止');
     let child;
@@ -188,13 +192,14 @@ async function agent(value: unknown, actor: AgentIdentity) {
 
 }
 
+const require = createRequire(import.meta.url);
 const assets: Record<string, [string, string]> = {
-  '/': ['public/index.html', 'text/html; charset=utf-8'],
-  '/app.js': ['public/app.js', 'text/javascript; charset=utf-8'],
-  '/app.css': ['public/app.css', 'text/css; charset=utf-8'],
-  '/vendor/xterm.js': ['node_modules/@xterm/xterm/lib/xterm.js', 'text/javascript'],
-  '/vendor/xterm.css': ['node_modules/@xterm/xterm/css/xterm.css', 'text/css'],
-  '/vendor/fit.js': ['node_modules/@xterm/addon-fit/lib/addon-fit.js', 'text/javascript']
+  '/': [path.join(ROOT, 'public/index.html'), 'text/html; charset=utf-8'],
+  '/app.js': [path.join(ROOT, 'public/app.js'), 'text/javascript; charset=utf-8'],
+  '/app.css': [path.join(ROOT, 'public/app.css'), 'text/css; charset=utf-8'],
+  '/vendor/xterm.js': [require.resolve('@xterm/xterm'), 'text/javascript'],
+  '/vendor/xterm.css': [require.resolve('@xterm/xterm/css/xterm.css'), 'text/css'],
+  '/vendor/fit.js': [require.resolve('@xterm/addon-fit'), 'text/javascript']
 };
 
 const server = http.createServer(async (req, res) => {
@@ -207,6 +212,10 @@ const server = http.createServer(async (req, res) => {
     if (!origin) return json(res, 403, { error: '来源不被允许' });
     const route = new URL(req.url ?? '/', origin).pathname;
     if (route === '/ui-version' && req.method === 'GET') return json(res, 200, { uiVersion });
+    if (route === '/agent/instance' && req.method === 'GET') {
+      if (!auth(req, agentToken)) return json(res, 401, { error: 'MCP 认证失败' });
+      return instance && !shuttingDown ? json(res, 200, instance) : json(res, 503, { error: '本机服务未就绪' });
+    }
     if (route === '/agent' && req.method === 'POST') {
       if (!auth(req, agentToken)) return json(res, 401, { error: 'MCP 认证失败' });
       const value = await body(req);
@@ -236,8 +245,8 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== 'GET' || !assets[route]) return json(res, 404, { error: '页面不存在' });
     const [file, contentType] = assets[route];
     res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-store' });
-    const content = await readFile(path.join(ROOT, file));
-    res.end(file === 'public/index.html' ? content.toString('utf8').replaceAll('__SST_UI_VERSION__', uiVersion) : content);
+    const content = await readFile(file);
+    res.end(route === '/' ? content.toString('utf8').replaceAll('__SST_UI_VERSION__', uiVersion) : content);
   } catch (e: any) { if (!res.headersSent) json(res, 400, { error: e.message ?? '操作失败' }); else res.end(); }
 });
 
@@ -322,34 +331,26 @@ wss.on('connection', ws => {
 });
 
 async function main() {
-  const requestedPort = preferredLocalPort(process.env.SHARED_SSH_PORT);
-  await mkdir(RUNTIME, { recursive: true });
-  await mkdir(DATA, { recursive: true });
-  // Exclusive owner file prevents two services from overwriting MCP discovery.
-  try {
-    const old = JSON.parse(await readFile(ownerFile, 'utf8'));
-    let alive = false;
-    try { process.kill(old.pid, 0); alive = true; } catch (e: any) { if (e.code !== 'ESRCH') alive = true; }
-    if (alive) throw new Error('会话服务已经运行，请使用已有窗口或先停止该服务');
-    await unlink(ownerFile);
-  } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
-  const owner = await open(ownerFile, 'wx', 0o600);
+  const requestedPort = configuredPort();
+  serviceLock = await acquireServiceLock(paths);
+  if (!serviceLock) throw new ServiceBusy();
   let uiPublished = false;
   try {
-    try { await owner.writeFile(JSON.stringify({ pid: process.pid })); }
-    finally { await owner.close(); }
-    await profiles.load();
+    await mkdir(DATA, { recursive: true, mode: 0o700 });
+    try { await profiles.load(); }
+    catch { throw new RuntimeError('无法加载本机服务器配置。请检查配置文件格式和目录权限，修复后重试。'); }
     const { address, port } = await listenLocal(server, requestedPort);
     const url = `http://${address}:${port}`;
     const uiUrl = `${url}/#${uiToken}`;
-    await writeRuntimeJson(uiFile, { url: uiUrl });
+    instance = { service: SERVICE_NAME, runtime: serviceLock.id, pid: process.pid, address, port };
+    await writeRuntimeJson(paths.ui, { url: uiUrl });
     uiPublished = true;
-    await writeRuntimeJson(connectionFile, { url, agentToken, pid: process.pid, address, port });
-    console.log(`共享 SSH 终端已启动：\n${uiUrl}\n关闭网页不会关闭 SSH。停止本服务会关闭所有 SSH 会话。`);
+    await writeRuntimeJson(paths.connection, { url, agentToken, pid: process.pid, address, port });
+    console.log(`共享 SSH 终端已启动 (${address}:${port})`);
   } catch (error) {
     server.close();
-    if (uiPublished) await unlink(uiFile).catch(() => {});
-    await unlink(ownerFile).catch(() => {});
+    if (uiPublished) await unlink(paths.ui).catch(() => {});
+    await serviceLock.release().catch(() => {});
     throw error;
   }
 }
@@ -359,10 +360,13 @@ async function shutdown() {
   for (const s of sessions.values()) s.close();
   for (const ws of sockets) ws.close(1001, '服务停止');
   server.close(); wss.close();
-  await Promise.all([connectionFile, uiFile].map(file => unlink(file).catch(() => {})));
-  await unlink(ownerFile).catch(() => {});
+  await Promise.all([paths.connection, paths.ui].map(file => unlink(file).catch(() => {})));
+  await serviceLock?.release().catch(() => {});
   setTimeout(() => process.exit(0), 500).unref();
 }
 const startup = main();
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
-startup.catch(e => { console.error(e.message); process.exitCode = 1; });
+startup.catch(error => {
+  if (error instanceof ServiceBusy) process.exitCode = SERVICE_BUSY;
+  else { console.error(runtimeErrorMessage(error)); process.exitCode = 1; }
+});

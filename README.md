@@ -28,11 +28,15 @@
 
 Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`。
 
-1. 双击 `start.cmd` 启动或打开已有本地服务，地址为 `http://127.0.0.1:43127/`。
+1. 双击 `start.cmd` 启动或复用本地服务并打开浏览器。默认地址为 `http://127.0.0.1:43127/`，端口被占用时会打开实际分配的地址。
 2. 添加服务器 Host、端口、用户及密码／私钥路径／系统 SSH Agent 认证方式。
 3. 可从 `%USERPROFILE%\.ssh\config` 快速导入 Host，导入后独立维护。不会修改原配置；连接使用 `-F NUL`，不会隐式叠加其他配置。
 4. 密钥可直接自动登录。密码认证可勾选“保存密码并自动登录”；不勾选时在终端手动输入。私钥口令和 `su - root` 密码仍由用户输入。
 5. 用户会话复制 sessionId 给指定 Agent 认领。释放输入权后，Agent 即可获取锁并操作，无需启用其他功能。
+
+配置和运行状态默认放在 `~/.shared-terminal/`。升级时可用环境变量接续旧配置目录，具体步骤见[本机配置与旧目录](docs/development.md#本机配置与旧目录)。
+
+从本地包安装后使用 `shared-ssh-terminal server` 启动或复用服务，`shared-ssh-terminal status` 查看实际地址与端口，`shared-ssh-terminal mcp` 供 MCP 客户端启动 stdio 适配端。在源码目录构建后，可用 `node dist/cli.js` 加同样的子命令。`stop` 会停止当前运行目录的服务并关闭其所有 SSH 会话。
 
 两个输入按钮始终同时展示：
 
@@ -53,7 +57,7 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 - “清空全部历史”同步清空当前屏幕、滚动历史和备用屏幕，用户与 MCP 均不能再读取已清内容；不发送 Shell 清屏命令，不改变锁或私密状态。
 - 清空不能撤回已进入 Agent 聊天上下文的内容，也不能阻止远端将同一内容重新输出。
 - 已关闭页签点击 × 后，所有页面同步移除，服务不再提供该会话的历史；移除活动连接必须先关闭。
-- 双击 `stop.cmd` 停止本地服务并关闭所有 SSH。本地服务重启后无法恢复旧 Shell；服务器配置仍保留。
+- 双击 `stop.cmd` 停止当前运行目录的本地服务并关闭其所有 SSH。服务重启后，服务器配置仍可使用，需要重新连接 SSH。
 - 页面会检测界面版本，在无待发送输入和编辑弹窗时刷新，保留选中页签。仅刷新网页不会结束 SSH。
 
 ## 保存密码与自动登录
@@ -68,7 +72,7 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 
 ## MCP
 
-`Register-MCP.ps1` 注册全局 Codex MCP（先备份配置）。每个应用启动独立 stdio 适配进程，适配进程不监听端口，共同连接单例本地会话服务。
+源码用 `Register-MCP.ps1` 注册全局 Codex MCP（先备份配置）。安装本地包后，MCP 客户端可配置 `shared-ssh-terminal mcp`。每个应用启动独立 stdio 适配进程，首次工具调用按同一运行目录查找服务，必要时启动后台实例。
 
 同一应用的不同项目或聊天先 `register_agent`，保存 id，后续每次调用传 `agentId`。默认 `list_sessions` 只列出自己的会话；`scope=all` 只列元数据，不授予访问权限。用户会话必须获得用户提供的 sessionId 才能认领。
 
@@ -109,7 +113,7 @@ MCP 标准通知只提示有新消息，正文通过任务身份读取；是否�
 
 - `node node_modules/typescript/bin/tsc`：构建。
 - `node --import tsx --test test/*.test.ts`：权限、唯一锁、显式释放、无注入、私密、保留历史、清空、输入按钮状态和配置导入。
-- `node scripts/e2e.mjs`：隔离的本机 OpenSSH/SSH2/ConPTY/MCP 测试，不连接业务服务器。覆盖密码和密钥登录、真实 Vim 增删改查保存、多页面逐字一致、网页全部离线、多个 Agent 的运行中交接，以及关闭／移除同步。
+- `node scripts/e2e.mjs`：隔离的本机 OpenSSH/SSH2/ConPTY/MCP 测试。覆盖密码和密钥登录、真实 Vim 增删改查保存、多页面逐字一致、网页全部离线、多个 Agent 的运行中交接，以及关闭／移除同步。
 - `node scripts/shell-smoke.mjs`：本机原始终端测试。设置 `SST_TEST_ZSH` 可同时验证本地 Zsh；不安装任何 Shell 回调。
 
 从旧版升级需要重新连接 SSH。旧 Shell 内曾安装的回调会随该 Shell 退出而消失；新版不再安装。已经写入服务器的旧命令历史不会自动删除。

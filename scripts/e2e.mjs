@@ -1,8 +1,9 @@
 // Real OpenSSH + PTY shared terminal test. Explicit input ownership; no Shell integration. Localhost only.
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
-import { spawn, execFileSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { spawn, execFile, execFileSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ssh2 from 'ssh2';
@@ -14,9 +15,9 @@ import { LoggingMessageNotificationSchema } from '@modelcontextprotocol/sdk/type
 import headless from '@xterm/headless';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-await mkdir(path.join(root, '.runtime'), { recursive: true });
-const temporary = await mkdtemp(path.join(root, '.runtime', 'e2e-'));
-const env = { ...process.env, SHARED_SSH_PORT: '43128', SHARED_SSH_DATA_DIR: path.join(temporary, 'data'), SHARED_SSH_RUNTIME_DIR: path.join(temporary, 'runtime') };
+const tempPrefix = path.resolve(tmpdir(), 'sst-e2e-');
+const temporary = await mkdtemp(tempPrefix);
+const env = { ...process.env, SHARED_SSH_PORT: '43128', SHARED_SSH_DATA_DIR: path.join(temporary, 'profile data'), SHARED_SSH_RUNTIME_DIR: path.join(temporary, 'runtime files') };
 const key = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'pkcs1', format: 'pem' } });
 const identity = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'pkcs1', format: 'pem' } });
 const identityFile = path.join(temporary, 'test-identity');
@@ -108,11 +109,14 @@ async function callWith(caller, name, args = {}, expectError = false) {
   assert(!value.isError, JSON.stringify(value)); return JSON.parse(value.content[0].text);
 }
 try {
-  service = spawn(process.execPath, ['dist/server.js'], { cwd: root, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  service = spawn(process.execPath, ['dist/cli.js', 'server'], { cwd: root, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   let serviceOutput = ''; service.stdout.on('data', data => serviceOutput += data); service.stderr.on('data', data => stderr += data);
-  await until(() => serviceOutput.includes('共享 SSH'), 'service startup');
+  await until(() => serviceOutput.includes('"running":true') || service.exitCode !== null, 'service startup');
+  assert(serviceOutput.includes('"running":true'), 'isolated service must start through the CLI');
   ui = JSON.parse(await readFile(path.join(env.SHARED_SSH_RUNTIME_DIR, 'ui.json'), 'utf8'));
   agent = JSON.parse(await readFile(path.join(env.SHARED_SSH_RUNTIME_DIR, 'connection.json'), 'utf8'));
+  assert.equal(agent.address, '127.0.0.1');
+  assert.equal(agent.url, `http://${agent.address}:${agent.port}`);
   const uiToken = new URL(ui.url).hash.slice(1);
   const create = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: { Authorization: `Bearer ${uiToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '本机 SSH 测试', host: '127.0.0.1', port: sshPort, username: 'test-user', auth: 'password', note: '临时测试' }) });
   assert.equal(create.status, 200); const profile = await create.json();
@@ -156,6 +160,7 @@ try {
   if (/continue connecting/i.test(output)) await input(id, 'yes\r');
   await until(() => /password:/i.test(output), 'password prompt'); await input(id, 'local-test-password\r');
   await until(() => output.includes('test-shell>'), 'password login');
+  assert((await readFile(path.join(env.SHARED_SSH_DATA_DIR, 'known_hosts'), 'utf8')).includes('ssh-rsa'));
   // Saved credentials use OpenSSH askpass, never terminal typing. A different
   // hostname exercises first-use fingerprint confirmation on the same test SSH.
   const savedResponse = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: { Authorization: `Bearer ${uiToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '保存密码测试', host: 'localhost', port: sshPort, username: 'test-user', auth: 'password', savePassword: true, password: 'local-test-password' }) });
@@ -392,6 +397,17 @@ try {
   for (const child of children) { try { child.write('exit\r'); } catch {} }
   for (let n = 0; n < 20 && children.size; n++) await new Promise(r => setTimeout(r, 50));
   for (const child of children) { try { child.kill(); } catch {} }
-  for (const c of connections) c.end(); ssh.close(); service?.kill();
+  for (const c of connections) c.end(); ssh.close();
+  if (service) {
+    const cleanup = await new Promise(resolve => {
+      execFile(process.execPath, ['dist/cli.js', 'stop'], { cwd: root, env, windowsHide: true, timeout: 10000 }, resolve);
+    });
+    if (cleanup) { process.exitCode = 1; console.error('Could not confirm the isolated service stopped.'); }
+    else {
+      const resolved = path.resolve(temporary);
+      assert(resolved.startsWith(tempPrefix) && path.dirname(resolved) === path.dirname(tempPrefix));
+      await rm(resolved, { recursive: true, force: true, maxRetries: 3 });
+    }
+  }
   setTimeout(() => process.exit(process.exitCode ?? 0), 500).unref();
 }

@@ -1,21 +1,23 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { readFile } from 'node:fs/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { AgentIdentity } from './agents.js';
+import { servicePaths } from './paths.js';
+import { ensureService, findService, RuntimeError, runtimeErrorMessage, type ServiceConnection } from './service-runtime.js';
 
-const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const runtime = process.env.SHARED_SSH_RUNTIME_DIR || path.join(root, '.runtime');
+const paths = servicePaths();
 const server = new McpServer({ name: 'shared-ssh-terminal', version: '0.6.0' }, { capabilities: { logging: {} } });
-type Context = { identity: AgentIdentity; secret: string; registered?: string; registering?: Promise<void>; watching?: boolean };
+type Context = { identity: AgentIdentity; secret: string; registered?: string; registering?: { token: string; promise: Promise<void> }; watching?: boolean };
 const contexts = new Map<string, Context>();
 let defaultContext: Context | undefined;
 let closed = false;
 const shutdown = new AbortController();
 server.server.onclose = () => { closed = true; shutdown.abort(); };
+let preparing: Promise<ServiceConnection> | undefined;
+function prepareService() {
+  return preparing ??= ensureService(paths, shutdown.signal).finally(() => { preparing = undefined; });
+}
 function watch(context: Context) {
   if (context.watching || closed) return;
   context.watching = true;
@@ -54,42 +56,50 @@ function newContext(name?: string, project?: string, task = '') {
 function contextFor(id?: unknown) {
   if (!id) return defaultContext ??= newContext();
   const context = typeof id === 'string' ? contexts.get(id) : undefined;
-  if (!context) throw new Error('此 agentId 不属于当前 MCP 适配实例，请使用 whoami 或 register_agent 返回的 ID');
+  if (!context) throw new RuntimeError('此 agentId 不属于当前 MCP 适配实例，请使用 whoami 或 register_agent 返回的 ID');
   return context;
 }
 async function request(action: string, args: Record<string, unknown>) {
   try {
-    const connection = JSON.parse(await readFile(path.join(runtime, 'connection.json'), 'utf8'));
-    const url = new URL(connection.url);
-    if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || url.username || url.password || url.pathname !== '/') throw new Error('会话服务地址必须是本机回环地址');
     const context = contextFor(args.agentId);
+    const connection = action === 'watch_messages' ? await findService(paths, shutdown.signal) : await prepareService();
+    if (!connection) throw new RuntimeError('本地服务尚未就绪。');
     let unreadCount = 0;
     const post = async (value: unknown) => {
-      const response = await fetch(new URL('/agent', url), {
+      const response = await fetch(new URL('/agent', connection.url), {
         method: 'POST', headers: { Authorization: `Bearer ${connection.agentToken}`, 'Content-Type': 'application/json',
           'X-Agent-Id': context.identity.id, 'X-Agent-Token': context.secret },
         body: JSON.stringify(value), signal: AbortSignal.any([AbortSignal.timeout(20000), shutdown.signal]), redirect: 'error'
       });
       const result = await response.json();
-      if (!response.ok) throw new Error(result.error || '共享终端请求失败');
+      if (!response.ok) throw new RuntimeError(result.error || '共享终端请求失败');
       unreadCount = Number(response.headers.get('X-Shared-Ssh-Unread-Count') || 0);
       return result;
     };
     if (context.registered !== connection.agentToken) {
-      context.registering ??= post({ action: 'register_agent', identity: context.identity, secret: context.secret }).then(() => { context.registered = connection.agentToken; }).finally(() => { context.registering = undefined; });
-      await context.registering;
+      if (context.registering?.token !== connection.agentToken) {
+        const promise = post({ action: 'register_agent', identity: context.identity, secret: context.secret }).then(() => {
+          if (context.registering?.promise === promise) context.registered = connection.agentToken;
+        }).finally(() => {
+          if (context.registering?.promise === promise) context.registering = undefined;
+        });
+        context.registering = { token: connection.agentToken, promise };
+      }
+      await context.registering.promise;
     }
     const { agentId, ...parameters } = args;
+    // Resolve and register before sending the action. A lost response does not
+    // establish whether a write occurred, so never replay the action.
     const result = await post({ action, ...parameters });
     watch(context);
     const content = [{ type: 'text' as const, text: JSON.stringify(result) }];
     if (unreadCount && !['watch_messages', 'read_messages'].includes(action)) {
-      const inbox = await post({ action: 'watch_messages', after: 0, waitMs: 0 });
-      if (inbox.messages.length) content.push({ type: 'text', text: JSON.stringify({ type: 'user_messages', messages: inbox.messages, totalMessages: inbox.totalMessages, hasMore: inbox.hasMore, instruction: '最多附带最近两条、2000 字符待收消息。请确认实际读到的 ID；更多内容用 read_messages 分页读取。' }) });
+      const inbox = await post({ action: 'watch_messages', after: 0, waitMs: 0 }).catch(() => undefined);
+      if (inbox?.messages.length) content.push({ type: 'text', text: JSON.stringify({ type: 'user_messages', messages: inbox.messages, totalMessages: inbox.totalMessages, hasMore: inbox.hasMore, instruction: '最多附带最近两条、2000 字符待收消息。请确认实际读到的 ID；更多内容用 read_messages 分页读取。' }) });
     }
     return { content };
-  } catch (e: any) {
-    const error = e.code === 'ENOENT' ? '请先启动本地共享终端服务' : e.message;
+  } catch (e) {
+    const error = e instanceof TypeError ? '本地服务连接中断，请先核对当前会话再继续操作。' : runtimeErrorMessage(e);
     return { isError: true, content: [{ type: 'text' as const, text: error }] };
   }
 }
