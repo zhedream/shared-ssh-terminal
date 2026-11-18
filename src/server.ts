@@ -1,5 +1,5 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
-import { readFile, writeFile, mkdir, unlink, open } from 'node:fs/promises';
+import { readFile, mkdir, unlink, open } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -12,6 +12,7 @@ import { readSshConfig } from './ssh-config.js';
 import { Agents, type AgentIdentity } from './agents.js';
 import { ensureAskpass, SavedPasswordPty } from './saved-password.js';
 import { Messages, messagePage } from './messages.js';
+import { listenLocal, localRequestOrigin, preferredLocalPort, writeRuntimeJson } from './local-network.js';
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const uiVersion = createHash('sha256').update(Buffer.concat(await Promise.all(
@@ -19,7 +20,9 @@ const uiVersion = createHash('sha256').update(Buffer.concat(await Promise.all(
 ))).digest('hex').slice(0, 16);
 const DATA = process.env.SHARED_SSH_DATA_DIR || path.join(ROOT, 'data');
 const RUNTIME = process.env.SHARED_SSH_RUNTIME_DIR || path.join(ROOT, '.runtime');
-const PORT = Number(process.env.SHARED_SSH_PORT ?? 43127);
+const ownerFile = path.join(RUNTIME, 'owner.json');
+const connectionFile = path.join(RUNTIME, 'connection.json');
+const uiFile = path.join(RUNTIME, 'ui.json');
 const token = () => randomBytes(32).toString('hex');
 const uiToken = token(), agentToken = token();
 const equal = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -30,7 +33,6 @@ const messages = new Messages();
 messages.setMaxListeners(100);
 const sockets = new Set<WebSocket>();
 const synchronizing = new Map<WebSocket, unknown[]>();
-const origin = `http://127.0.0.1:${PORT}`;
 let shuttingDown = false;
 let creating = 0;
 
@@ -49,8 +51,6 @@ async function body(req: IncomingMessage) {
 function auth(req: IncomingMessage, secret: string) {
   return equal(req.headers.authorization ?? '', `Bearer ${secret}`);
 }
-function validHost(req: IncomingMessage) { return req.headers.host === `127.0.0.1:${PORT}`; }
-function validOrigin(req: IncomingMessage) { return !req.headers.origin || req.headers.origin === origin; }
 function send(ws: WebSocket, value: unknown) {
   if (ws.readyState !== WebSocket.OPEN) return;
   if (ws.bufferedAmount > 2 * 1024 * 1024) { ws.close(1013, '输出积压，请重新连接'); return; }
@@ -203,7 +203,8 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   try {
-    if (!validHost(req) || !validOrigin(req)) return json(res, 403, { error: '来源不被允许' });
+    const origin = localRequestOrigin(req);
+    if (!origin) return json(res, 403, { error: '来源不被允许' });
     const route = new URL(req.url ?? '/', origin).pathname;
     if (route === '/ui-version' && req.method === 'GET') return json(res, 200, { uiVersion });
     if (route === '/agent' && req.method === 'POST') {
@@ -242,7 +243,7 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 server.on('upgrade', (req, socket, head) => {
-  if (!validHost(req) || req.headers.origin !== origin || req.url !== '/terminal') { socket.destroy(); return; }
+  if (!localRequestOrigin(req, true) || req.url !== '/terminal') { socket.destroy(); return; }
   wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws));
 });
 wss.on('connection', ws => {
@@ -321,11 +322,10 @@ wss.on('connection', ws => {
 });
 
 async function main() {
-  if (!Number.isInteger(PORT) || PORT < 1024 || PORT > 65535) throw new Error('端口需要在 1024 到 65535 之间');
+  const requestedPort = preferredLocalPort(process.env.SHARED_SSH_PORT);
   await mkdir(RUNTIME, { recursive: true });
   await mkdir(DATA, { recursive: true });
   // Exclusive owner file prevents two services from overwriting MCP discovery.
-  const ownerFile = path.join(RUNTIME, 'owner.json');
   try {
     const old = JSON.parse(await readFile(ownerFile, 'utf8'));
     let alive = false;
@@ -334,22 +334,35 @@ async function main() {
     await unlink(ownerFile);
   } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
   const owner = await open(ownerFile, 'wx', 0o600);
-  await owner.writeFile(JSON.stringify({ pid: process.pid })); await owner.close();
+  let uiPublished = false;
   try {
+    try { await owner.writeFile(JSON.stringify({ pid: process.pid })); }
+    finally { await owner.close(); }
     await profiles.load();
-    await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(PORT, '127.0.0.1', resolve); });
-    await writeFile(path.join(RUNTIME, 'connection.json'), JSON.stringify({ url: origin, agentToken, pid: process.pid }), { mode: 0o600 });
-    await writeFile(path.join(RUNTIME, 'ui.json'), JSON.stringify({ url: `${origin}/#${uiToken}` }), { mode: 0o600 });
-    console.log(`共享 SSH 终端已启动：\n${origin}/#${uiToken}\n关闭网页不会关闭 SSH。停止本服务会关闭所有 SSH 会话。`);
-  } catch (e) { await unlink(ownerFile).catch(() => {}); throw e; }
+    const { address, port } = await listenLocal(server, requestedPort);
+    const url = `http://${address}:${port}`;
+    const uiUrl = `${url}/#${uiToken}`;
+    await writeRuntimeJson(uiFile, { url: uiUrl });
+    uiPublished = true;
+    await writeRuntimeJson(connectionFile, { url, agentToken, pid: process.pid, address, port });
+    console.log(`共享 SSH 终端已启动：\n${uiUrl}\n关闭网页不会关闭 SSH。停止本服务会关闭所有 SSH 会话。`);
+  } catch (error) {
+    server.close();
+    if (uiPublished) await unlink(uiFile).catch(() => {});
+    await unlink(ownerFile).catch(() => {});
+    throw error;
+  }
 }
 async function shutdown() {
   if (shuttingDown) return; shuttingDown = true;
+  try { await startup; } catch { return; }
   for (const s of sessions.values()) s.close();
   for (const ws of sockets) ws.close(1001, '服务停止');
-  await Promise.all(['owner.json', 'connection.json', 'ui.json'].map(f => unlink(path.join(RUNTIME, f)).catch(() => {})));
   server.close(); wss.close();
+  await Promise.all([connectionFile, uiFile].map(file => unlink(file).catch(() => {})));
+  await unlink(ownerFile).catch(() => {});
   setTimeout(() => process.exit(0), 500).unref();
 }
+const startup = main();
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
-main().catch(e => { console.error(e.message); process.exitCode = 1; server.close(); });
+startup.catch(e => { console.error(e.message); process.exitCode = 1; });
