@@ -72,11 +72,9 @@ async function startService(t: TestContext, preferredPort?: number, blockDiscove
       assert(Number.isInteger(connection.port) && connection.port >= 1024 && connection.port <= 65535);
       assert.equal(connection.url, `http://${ipv4}:${connection.port}`);
       assert(/^[a-f0-9]{64}$/.test(connection.agentToken), 'Legacy agentToken is available');
-      const ui = new URL(JSON.parse(await readFile(path.join(runtime, 'ui.json'), 'utf8')).url);
-      assert.equal(ui.origin, connection.url);
-      const uiToken = ui.hash.slice(1);
-      assert(/^[a-f0-9]{64}$/.test(uiToken) && uiToken !== connection.agentToken, 'UI uses a distinct token');
-      return { port: connection.port as number, url: connection.url as string, uiToken };
+      const { adminToken } = JSON.parse(await readFile(path.join(runtime, 'ui.json'), 'utf8'));
+      assert(/^[a-f0-9]{64}$/.test(adminToken) && adminToken !== connection.agentToken, 'Management uses a distinct token');
+      return { port: connection.port as number, url: connection.url as string, adminToken };
     }
     throw new Error('Timed out waiting for test service discovery');
   }
@@ -84,14 +82,13 @@ async function startService(t: TestContext, preferredPort?: number, blockDiscove
   return { discover, runtime, closed, stderr: () => stderr };
 }
 
-async function wsSynced(authority: string, uiToken: string) {
-  const ws = new WebSocket(`ws://${authority}/terminal`, { origin: `http://${authority}`, handshakeTimeout: 3000 });
+async function wsSynced(authority: string, cookie: string) {
+  const ws = new WebSocket(`ws://${authority}/terminal`, { origin: `http://${authority}`, headers: { cookie }, handshakeTimeout: 3000 });
   try {
     const synced = new Promise<void>((resolve, reject) => {
       ws.on('message', raw => { if (JSON.parse(raw.toString()).type === 'synced') resolve(); });
       ws.once('error', reject);
       ws.once('close', code => reject(new Error(`WebSocket closed before sync: ${code}`)));
-      ws.once('open', () => ws.send(JSON.stringify({ type: 'auth', token: uiToken })));
     });
     await synced;
   } finally { ws.terminate(); }
@@ -123,9 +120,9 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
   const preferred = await reservePort(0);
   t.after(preferred.close);
   const service = await startService(t, preferred.port);
-  const { port, url, uiToken } = await service.discover();
+  const { port, url, adminToken } = await service.discover();
   assert.notEqual(port, preferred.port);
-  const authorization = `Bearer ${uiToken}`;
+  const authorization = `Bearer ${adminToken}`;
   const status = (target: string, headers: OutgoingHttpHeaders | string[] = {}, method = 'GET') => new Promise<number | undefined>((resolve, reject) => {
     const req = request(target, { headers, method, signal: AbortSignal.timeout(3000) }, response => {
       response.on('error', reject);
@@ -139,10 +136,16 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
     const authority = `${host}:${port}`;
     const origin = `http://${authority}`;
     assert.equal(await status(`${origin}/`), 200);
-    assert.equal(await status(`${origin}/api/state`, { authorization, origin }), 200);
-    await wsSynced(authority, uiToken);
+    const issued = await fetch(url + '/api/pair-code', { method: 'POST', headers: { authorization } });
+    assert.equal(issued.status, 200);
+    const { code } = await issued.json();
+    const redeemed = await fetch(origin + '/api/pair', { method: 'POST', headers: { origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) });
+    assert.equal(redeemed.status, 204);
+    const cookie = redeemed.headers.get('set-cookie')!.split(';')[0];
+    assert.equal(await status(`${origin}/api/state`, { cookie }), 200);
+    await wsSynced(authority, cookie);
   }
-  assert.equal(await status(`${url}/api/state`, { authorization }), 200);
+  assert.equal(await status(`${url}/api/state`, { authorization }), 401);
   assert.equal(await status(`${url}/api/state`), 401);
   assert.equal(await status(`${url}/agent`, { authorization }, 'POST'), 401);
   const rejectedHeaders = [
@@ -166,7 +169,7 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
   const noOrigin = new WebSocket(`ws://${ipv4}:${port}/terminal`, { handshakeTimeout: 3000 });
   try { await assert.rejects(once(noOrigin, 'open'), /socket hang up/); }
   finally { noOrigin.terminate(); }
-  await assert.rejects(wsSynced(`${ipv4}:${port}`, 'wrong-token'), /closed before sync: 1008/);
+  await assert.rejects(wsSynced(`${ipv4}:${port}`, ''), /Unexpected server response: 401/);
 
   const client = new Client({ name: 'local-network-test', version: '1.0.0' });
   const transport = new StdioClientTransport({
@@ -184,7 +187,7 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
 
   assert.equal(await status(`${url}/api/shutdown`, { authorization }, 'POST'), 200);
   assert.deepEqual(await service.closed, [0, null]);
-  assert.deepEqual(await readdir(service.runtime), []);
+  assert.deepEqual(await readdir(service.runtime), ['pairing-key.json']);
 });
 
 test('a non-conflict bind error is propagated without a second bind', async t => {
@@ -213,6 +216,6 @@ test('failed discovery publication cleans up its temporary files and UI address'
   const service = await startService(t, preferred.port, true);
   assert.deepEqual(await service.closed, [1, null]);
   assert.match(service.stderr(), /rename/);
-  assert.deepEqual(await readdir(service.runtime), ['connection.json']);
+  assert.deepEqual(await readdir(service.runtime), ['connection.json', 'pairing-key.json']);
   assert.deepEqual(await readdir(path.join(service.runtime, 'connection.json')), []);
 });

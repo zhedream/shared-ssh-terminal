@@ -2,9 +2,12 @@
 const $ = id => document.getElementById(id);
 const loadedUiVersion = document.querySelector('meta[name="ui-version"]')?.content;
 let reloadScheduled = false;
-const authStorageKey = 'shared-ssh-token';
-let token = location.hash.slice(1) || localStorage.getItem(authStorageKey) || sessionStorage.getItem(authStorageKey);
-if (location.hash) history.replaceState(null, '', '/');
+function takeLaunchCode() {
+  const fragment = location.hash;
+  if (!fragment) return null;
+  history.replaceState(null, '', location.pathname + location.search);
+  return new URLSearchParams(fragment.slice(1)).get('pair');
+}
 const sessions = new Map(), terminals = new Map(), pending = new Map();
 const controlPending = new Set();
 const sessionMessages = new Map(), messageDrafts = new Map();
@@ -24,13 +27,23 @@ try {
 } catch { dismissedTabs = new Set(); }
 function saveDismissedTabs() { try { localStorage.setItem(dismissedStorageKey, JSON.stringify([...dismissedTabs].slice(-1000).sort())); } catch {} }
 let profiles = [], activeId = null, socket, clientId, ready = false, reconnectTimer, toastTimer;
+let pairing = false, checkingAuth = false;
 function toast(message) { $('toast').textContent = message; $('toast').classList.remove('hidden'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').classList.add('hidden'), 6500); }
 async function api(route, options = {}) {
-  const response = await fetch(route, { ...options, headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...options.headers } });
+  if (!ready) throw new Error('请先连接共端');
+  const connection = socket;
+  const response = await fetch(route, { ...options, credentials: 'same-origin', headers: { 'Content-Type': 'application/json', ...options.headers } });
+  if (!ready || socket !== connection) throw new Error('连接已变化，请检查操作结果');
+  if (response.status === 401) {
+    ready = false;
+    $('workspace').inert = true;
+    connection.close();
+    throw new Error('浏览器登录态已失效');
+  }
   const data = await response.json(); if (!response.ok) throw new Error(data.error); return data;
 }
 function request(type, args = {}) {
-  if (!ready || socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error('本地服务尚未连接'));
+  if (!ready || socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('本地服务尚未连接'));
   const requestId = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('操作响应超时；请查看终端状态，勿重复提交命令')); }, 10000);
@@ -38,14 +51,20 @@ function request(type, args = {}) {
   });
 }
 function getActive() { const s = sessions.get(activeId); if (!s) throw new Error('请先建立连接'); return s; }
+function canReloadUi() {
+  return !pairing && !checkingAuth && !$('pair-code').value && !pending.size &&
+    ![...messageDrafts.values()].some(d => d.text) &&
+    ![...terminals.values()].some(t => t.sending || t.input) &&
+    !document.querySelector('dialog[open]');
+}
 function refreshUpdatedUi(version) {
   if (!loadedUiVersion || !/^[a-f0-9]{16}$/.test(version) || version === loadedUiVersion) return;
-  if (reloadScheduled || pending.size || [...messageDrafts.values()].some(d => d.text) || [...terminals.values()].some(t => t.sending || t.input) || document.querySelector('dialog[open]')) return;
+  if (reloadScheduled || !canReloadUi()) return;
   reloadScheduled = true;
   toast('界面已更新，正在同步新版；SSH 连接会保留。');
   setTimeout(() => {
     reloadScheduled = false;
-    if (pending.size || [...messageDrafts.values()].some(d => d.text) || [...terminals.values()].some(t => t.sending || t.input) || document.querySelector('dialog[open]')) return;
+    if (!canReloadUi()) return;
     try { if (activeId) sessionStorage.setItem('shared-ssh-active-tab', activeId); } catch {}
     location.reload();
   }, 700);
@@ -58,7 +77,6 @@ async function checkUiVersion() {
 }
 setInterval(checkUiVersion, 15000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) void checkUiVersion(); });
-void checkUiVersion();
 function canInput(s) { return ready && s.status === 'open' && (!s.lock || (s.lock.kind === 'user' && s.lock.owner === clientId)); }
 function element(tag, className, text) { const el = document.createElement(tag); if (className) el.className = className; if (text !== undefined) el.textContent = text; return el; }
 function actorLabel(actor) {
@@ -216,11 +234,133 @@ function fitActive() {
   const cols = Math.max(20, Math.min(400, size.cols)), rows = Math.max(5, Math.min(160, size.rows));
   if (cols !== s.cols || rows !== s.rows) request('resize', { sessionId: s.id, cols, rows }).catch(e => toast(e.message));
 }
-function connect() {
-  if (!token) { $('connection-text').textContent = '请先从启动入口打开一次'; toast('首次使用请双击 start.cmd；之后同一浏览器可直接打开此地址。'); return; }
-  socket = new WebSocket(`ws://${location.host}/terminal`);
-  socket.addEventListener('open', () => socket.send(JSON.stringify({ type: 'auth', token })));
-  socket.addEventListener('message', event => {
+function updatePairControls() {
+  const busy = pairing || checkingAuth;
+  $('pair-code').disabled = busy;
+  $('pair-submit').disabled = busy;
+  $('pair-check').disabled = busy;
+}
+function showPairing(message) {
+  const panel = $('pair-panel');
+  $('workspace').classList.add('hidden');
+  $('workspace').inert = true;
+  for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
+  invalidateHistory('');
+  historySessionId = undefined;
+  for (const t of terminals.values()) {
+    clearTimeout(t.schedule);
+    t.input = '';
+    t.term.dispose();
+    t.pane.remove();
+  }
+  sessions.clear();
+  terminals.clear();
+  sessionMessages.clear();
+  messageDrafts.clear();
+  normalHistoryRevisions.clear();
+  profiles = [];
+  importCandidates = [];
+  activeId = null;
+  messagesOpen = false;
+  messageTarget = undefined;
+  $('message-text').value = '';
+  $('message-list').replaceChildren();
+  $('import-path').textContent = '';
+  $('import-candidates').replaceChildren();
+  $('import-notes').textContent = '';
+  $('toast').classList.add('hidden');
+  renderProfiles();
+  renderTabs();
+  renderActive();
+  $('connection-text').textContent = '需要配对浏览器';
+  $('pair-status').textContent = message;
+  panel.classList.remove('hidden');
+  if (!$('pair-code').disabled) $('pair-code').focus();
+}
+function scheduleReconnect() {
+  $('connection-text').textContent = '连接暂时中断，正在重新检查…';
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => void connect(), 2000);
+}
+async function connect(afterPair = false) {
+  if (checkingAuth || socket) return;
+  clearTimeout(reconnectTimer);
+  checkingAuth = true;
+  updatePairControls();
+  let response;
+  try {
+    response = await fetch('/api/auth', { credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(10000) });
+  } catch {
+    scheduleReconnect();
+    if (!$('pair-panel').classList.contains('hidden')) $('pair-status').textContent = '暂时无法连接共端。请稍后重新检查连接。';
+    return;
+  } finally {
+    checkingAuth = false;
+    updatePairControls();
+  }
+  if (response.status === 401) {
+    showPairing(afterPair ? '配对请求已完成，但浏览器未保留登录状态。请允许此站点使用 Cookie，再生成新配对码。' : '此浏览器尚未配对，或登录状态已失效。');
+    return;
+  }
+  if (response.status !== 204) {
+    scheduleReconnect();
+    if (!$('pair-panel').classList.contains('hidden')) $('pair-status').textContent = '暂时无法检查登录状态。请稍后重新检查连接。';
+    return;
+  }
+  $('pair-panel').classList.add('hidden');
+  $('pair-code').value = '';
+  $('pair-status').textContent = '';
+  $('connection-text').textContent = '正在同步共享会话…';
+  const url = new URL('/terminal', location.href);
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  try {
+    openTerminalSocket(url);
+  } catch {
+    scheduleReconnect();
+  }
+}
+async function redeemPairing(code) {
+  if (pairing || checkingAuth || socket) return;
+  clearTimeout(reconnectTimer);
+  pairing = true;
+  updatePairControls();
+  $('pair-code').value = '';
+  $('connection-text').textContent = '正在配对浏览器…';
+  $('pair-status').textContent = '正在检查配对码…';
+  let status;
+  try {
+    const response = await fetch('/api/pair', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+      signal: AbortSignal.timeout(10000),
+    });
+    status = response.status;
+  } catch {
+    // A lost response may follow a successful redemption. The user can check the Cookie before requesting a new code.
+  } finally {
+    pairing = false;
+    updatePairControls();
+  }
+  if (status === 204) {
+    await connect(true);
+  } else if (status === 400) {
+    showPairing('配对码无效、已过期或已使用。请生成新配对码后重试。');
+  } else if (status === 429) {
+    showPairing('配对请求过于频繁。请稍后再试。');
+  } else {
+    showPairing('未能确认配对结果。请先重新检查连接，或生成新配对码后重试。');
+  }
+}
+function openTerminalSocket(url) {
+  const connection = new WebSocket(url);
+  socket = connection;
+  // The browser sends its Cookie with the upgrade. Wait for the initial sync before enabling writes.
+  const syncTimeout = setTimeout(() => connection.close(), 10000);
+  connection.addEventListener('message', event => {
+    if (socket !== connection || connection.readyState !== WebSocket.OPEN) return;
     const p = JSON.parse(event.data);
     if (p.type === 'hello') {
       refreshUpdatedUi(p.uiVersion);
@@ -235,10 +375,9 @@ function connect() {
       if (!ids.has(activeId)) activeId = null;
       for (const s of p.sessions) { updateSession(s); terminals.get(s.id)?.term.reset(); }
     } else if (p.type === 'synced') {
-      // Publish only a verified credential; an old bookmarked launch URL must
-      // not replace a working credential in other windows.
-      if (localStorage.getItem(authStorageKey) !== token) localStorage.setItem(authStorageKey, token);
-      sessionStorage.removeItem(authStorageKey);
+      clearTimeout(syncTimeout);
+      $('workspace').classList.remove('hidden');
+      $('workspace').inert = false;
       ready = true; for (const s of p.sessions) updateSession(s);
       try {
         const restored = sessionStorage.getItem('shared-ssh-active-tab'); sessionStorage.removeItem('shared-ssh-active-tab');
@@ -276,22 +415,17 @@ function connect() {
       else if (p.type === 'error') toast(p.error);
     }
   });
-  socket.addEventListener('close', event => {
+  connection.addEventListener('close', () => {
+    clearTimeout(syncTimeout);
+    if (socket !== connection) return;
+    socket = undefined;
     ready = false; $('connection-dot').classList.remove('connected');
+    $('workspace').inert = true;
     for (const t of terminals.values()) { t.input = ''; clearTimeout(t.schedule); t.schedule = null; }
     for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('连接已断开；不自动重发输入')); } pending.clear();
-    renderProfiles(); renderActive(); clearTimeout(reconnectTimer);
-    if (event.code === 1008) {
-      const latest = localStorage.getItem(authStorageKey);
-      if (latest && latest !== token) { token = latest; reconnectTimer = setTimeout(connect, 100); return; }
-      $('connection-text').textContent = '访问凭据已失效，请重新打开启动入口';
-      toast('服务可能已重启。双击 start.cmd 更新访问凭据，已打开的其他窗口会自动同步。');
-      return;
-    }
-    $('connection-text').textContent = '本地界面连接中断 · 正在重连（不代表 SSH 已关闭）';
-    reconnectTimer = setTimeout(connect, 2000);
+    renderProfiles(); renderActive();
+    scheduleReconnect();
   });
-  socket.addEventListener('error', () => {});
 }
 async function loadHistory(older = false) {
   if (historyBusy || !historySessionId) return;
@@ -425,22 +559,16 @@ $('copy-session').addEventListener('click', async () => {
 });
 let resizeTimer; window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(fitActive, 100); });
 window.addEventListener('storage', event => {
-  if (event.key === dismissedStorageKey && event.newValue) {
-    try {
-      const ids = JSON.parse(event.newValue);
-      if (Array.isArray(ids)) for (const id of ids) {
-        if (typeof id !== 'string' || id.length !== 36) continue;
-        dismissedTabs.add(id);
-        if (sessions.get(id)?.status === 'closed') dismissClosedTab(id, false);
-      }
-    } catch {}
-    return;
-  }
-  if (event.key !== authStorageKey || !event.newValue || event.newValue === token) return;
-  token = event.newValue; clearTimeout(reconnectTimer);
-  if (socket && socket.readyState < WebSocket.CLOSING) socket.close(); else connect();
+  if (event.key !== dismissedStorageKey || !event.newValue) return;
+  try {
+    const ids = JSON.parse(event.newValue);
+    if (Array.isArray(ids)) for (const id of ids) {
+      if (typeof id !== 'string' || id.length !== 36) continue;
+      dismissedTabs.add(id);
+      if (sessions.get(id)?.status === 'closed') dismissClosedTab(id, false);
+    }
+  } catch {}
 });
-connect();
 
 let importCandidates = [];
 $('import-config').addEventListener('click', async () => {
@@ -472,3 +600,15 @@ $('import-save').addEventListener('click', async () => {
   } catch (e) { toast(`已添加 ${added} 项；${e.message}`); }
   finally { $('import-save').disabled = false; }
 });
+
+$('pair-form').addEventListener('submit', event => {
+  event.preventDefault();
+  void redeemPairing($('pair-code').value.trim());
+});
+$('pair-check').addEventListener('click', () => { if (!pairing) void connect(); });
+
+{
+  const launchCode = takeLaunchCode();
+  if (launchCode === null) void connect();
+  else void redeemPairing(launchCode);
+}

@@ -85,7 +85,7 @@ test('simultaneous CLI and MCP first calls converge, and the same adapters recon
   assert.equal(connection.port, first.port);
   const logged = [(await readFile(f.paths.stdout, 'utf8')), (await readFile(f.paths.stderr, 'utf8')), started[0].stdout, a.stderr()].join('\n');
   assert.equal(logged.match(/共享 SSH 终端已启动/g)?.length, 1);
-  assert(!logged.includes(connection.agentToken) && !logged.includes(new URL(ui.url).hash.slice(1)));
+  assert(!logged.includes(connection.agentToken) && !logged.includes(ui.adminToken));
 
   const stopped = await f.cli('stop');
   assert.equal(JSON.parse(stopped.stdout).stopped, true);

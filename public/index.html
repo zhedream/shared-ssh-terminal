@@ -15,9 +15,21 @@
   <header class="app-header">
     <div class="brand"><span class="brand-mark">›_</span><div><strong>共端</strong><span>SHARED SSH</span></div></div>
     <div class="header-description">共享画面，独占输入，随时交接。</div>
-    <div class="connection"><i id="connection-dot"></i><span id="connection-text">正在连接本地服务</span></div>
+    <div class="connection" role="status"><i id="connection-dot"></i><span id="connection-text">正在检查浏览器连接</span></div>
   </header>
-  <div class="workspace">
+  <main id="pair-panel" class="pair-panel hidden" aria-labelledby="pair-title">
+    <form id="pair-form" class="pair-form" method="post" autocomplete="off">
+      <h1 id="pair-title">配对此浏览器</h1>
+      <p id="pair-help">在本机运行 <code>shared-ssh-terminal pair</code>，然后打开生成的链接或粘贴配对码。</p>
+      <label for="pair-code">配对码<input id="pair-code" type="password" required autocomplete="off" spellcheck="false" aria-describedby="pair-help pair-status"></label>
+      <p id="pair-status" role="status"></p>
+      <div class="pair-actions">
+        <button id="pair-submit" class="primary" type="submit">配对</button>
+        <button id="pair-check" type="button">重新检查连接</button>
+      </div>
+    </form>
+  </main>
+  <div id="workspace" class="workspace hidden" inert>
     <aside class="sidebar">
       <div class="section-title"><span>服务器</span><button id="add-server" class="icon-button" title="添加服务器" aria-label="添加服务器">＋</button></div>
       <button id="import-config" class="import-button">↓ 从 SSH config 快速添加</button>

@@ -5,3 +5,25 @@
 #password-field .save-password-option{display:flex;align-items:center;gap:9px}#password-field input[type=checkbox]{display:inline-block;width:16px;height:16px;margin:0;padding:0;accent-color:var(--accent)}
 .agent-messages{border-bottom:1px solid var(--border);padding:12px 18px;background:#111d27;max-height:330px;overflow:auto;flex-shrink:0}.message-heading{display:flex;align-items:center;gap:12px}.message-heading span{flex:1;color:#91a8bd;font-size:11px;overflow-wrap:anywhere}.message-heading button{font-size:11px;padding:4px 8px}.agent-messages p{font-size:11px;color:#91a8bd;line-height:1.6;margin:7px 0}.message-list{max-height:130px;overflow:auto}.message-item{padding:7px 0;border-bottom:1px solid #243341}.message-meta{font-size:10px;color:#839aad}.message-body{white-space:pre-wrap;overflow-wrap:anywhere;margin-top:4px;font-size:12px}#message-form{display:flex;align-items:flex-end;gap:10px;margin-top:10px}#message-text{flex:1;min-width:0;resize:vertical;border:1px solid #344153;border-radius:6px;background:#0e1621;color:#e8eef6;padding:8px;font:inherit}#message-form button{flex-shrink:0}.message-input-label{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
 #history-dialog{width:850px}#history-description{font-size:12px;color:#91a8bd;line-height:1.7}.history-text{white-space:pre-wrap;overflow-wrap:anywhere;background:#0c121b;padding:14px;max-height:55vh;min-height:130px;overflow:auto;font:12px Consolas,"Microsoft YaHei",monospace;color:#d5e1ef}#history-status{font-size:11px;color:#91a8bd;align-self:center;line-height:1.6}
+
+.pair-panel {
+  display: grid;
+  place-items: center;
+  max-height: calc(100vh - 74px);
+  min-height: 0;
+  height: calc(100vh - 74px);
+  overflow: auto;
+  padding: 20px;
+}
+.pair-form {
+  width: min(100%, 420px);
+  padding: clamp(18px, 5vw, 28px);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #131d29;
+}
+.pair-form h1 { margin: 0 0 12px; font-size: 22px; }
+.pair-form p { color: #acbdd1; line-height: 1.65; }
+.pair-form code { color: var(--accent); overflow-wrap: anywhere; }
+#pair-status:empty { display: none; }
+.pair-actions { display: flex; flex-wrap: wrap; gap: 8px; }

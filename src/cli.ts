@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { servicePaths } from './paths.js';
-import { browserUrl, ensureService, RuntimeError, runtimeErrorMessage, serviceStatus, stopService } from './service-runtime.js';
+import { pairingUrl, ensureService, RuntimeError, runtimeErrorMessage, serviceStatus, stopService } from './service-runtime.js';
 
 function openBrowser(url: string) {
   return new Promise<void>((resolve, reject) => {
@@ -26,12 +26,16 @@ async function main(args: string[]) {
   if (command === 'server' && (args.length === 1 || (args.length === 2 && args[1] === '--open'))) {
     if (args[1] && process.platform !== 'win32') throw new RuntimeError('--open 仅支持 Windows，请在 Windows 使用旧入口打开页面。');
     const service = await ensureService(paths);
-    if (args[1]) await openBrowser(await browserUrl(paths, service));
+    if (args[1]) await openBrowser(await pairingUrl(paths, service));
     console.log(JSON.stringify({ running: true, address: service.address, port: service.port, pid: service.pid }));
     return;
   }
   if (args.length === 1 && command === 'status') {
     console.log(JSON.stringify(await serviceStatus(paths)));
+    return;
+  }
+  if (args.length === 1 && command === 'pair') {
+    console.log(await pairingUrl(paths, await ensureService(paths)));
     return;
   }
   if (args.length === 1 && command === 'stop') {
@@ -40,7 +44,7 @@ async function main(args: string[]) {
     console.log(JSON.stringify({ stopped }));
     return;
   }
-  const usage = '用法: shared-ssh-terminal server [--open] | status | mcp | stop';
+  const usage = '用法: shared-ssh-terminal server [--open] | status | pair | mcp | stop';
   if (!args.length || (args.length === 1 && command === '--help')) { console.log(usage); return; }
   throw new RuntimeError(usage);
 }

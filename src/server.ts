@@ -12,7 +12,8 @@ import { readSshConfig } from './ssh-config.js';
 import { Agents, type AgentIdentity } from './agents.js';
 import { ensureAskpass, SavedPasswordPty } from './saved-password.js';
 import { Messages, messagePage } from './messages.js';
-import { listenLocal, localRequestOrigin, writeRuntimeJson } from './local-network.js';
+import { LOCAL_ADDRESS, listenLocal, localRequestOrigin, writeRuntimeJson } from './local-network.js';
+import { loadPairingKey, Pairing, pairingError } from './pairing.js';
 import { installRoot as ROOT, servicePaths } from './paths.js';
 import { acquireServiceLock, configuredPort, RuntimeError, runtimeErrorMessage, SERVICE_BUSY, SERVICE_NAME } from './service-runtime.js';
 
@@ -25,8 +26,8 @@ let serviceLock: Awaited<ReturnType<typeof acquireServiceLock>>;
 let instance: { service: string; runtime: string; pid: number; address: string; port: number } | undefined;
 class ServiceBusy extends Error {}
 const token = () => randomBytes(32).toString('hex');
-const uiToken = token(), agentToken = token();
-const equal = (a: string, b: string) => a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const adminToken = token(), agentToken = token();
+let pairing: Pairing | undefined;
 const profiles = new Profiles(DATA);
 const agents = new Agents();
 const sessions = new Map<string, Session>();
@@ -41,16 +42,29 @@ function json(res: ServerResponse, status: number, data: unknown) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(data));
 }
-async function body(req: IncomingMessage) {
+async function body(req: IncomingMessage, limit = 128 * 1024) {
   let value = '';
-  for await (const chunk of req) {
+  for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     value += chunk.toString();
-    if (value.length > 128 * 1024) throw new Error('请求过大');
+    if (value.length > limit) {
+      req.resume();
+      throw new Error('请求过大');
+    }
   }
   return JSON.parse(value || '{}');
 }
 function auth(req: IncomingMessage, secret: string) {
-  return equal(req.headers.authorization ?? '', `Bearer ${secret}`);
+  const authorization = req.headersDistinct.authorization;
+  if (authorization?.length !== 1) return false;
+  const provided = Buffer.from(authorization[0]);
+  const expected = Buffer.from(`Bearer ${secret}`);
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
+}
+function localManagement(req: IncomingMessage) {
+  return req.socket.localAddress === LOCAL_ADDRESS && req.socket.remoteAddress === LOCAL_ADDRESS && req.headers.origin === undefined;
+}
+function empty(res: ServerResponse) {
+  res.writeHead(204, { 'Cache-Control': 'no-store' }).end();
 }
 function send(ws: WebSocket, value: unknown) {
   if (ws.readyState !== WebSocket.OPEN) return;
@@ -213,11 +227,11 @@ const server = http.createServer(async (req, res) => {
     const route = new URL(req.url ?? '/', origin).pathname;
     if (route === '/ui-version' && req.method === 'GET') return json(res, 200, { uiVersion });
     if (route === '/agent/instance' && req.method === 'GET') {
-      if (!auth(req, agentToken)) return json(res, 401, { error: 'MCP 认证失败' });
+      if (!localManagement(req) || !auth(req, agentToken)) return json(res, 401, { error: 'MCP 认证失败' });
       return instance && !shuttingDown ? json(res, 200, instance) : json(res, 503, { error: '本机服务未就绪' });
     }
     if (route === '/agent' && req.method === 'POST') {
-      if (!auth(req, agentToken)) return json(res, 401, { error: 'MCP 认证失败' });
+      if (!localManagement(req) || !auth(req, agentToken)) return json(res, 401, { error: 'MCP 认证失败' });
       const value = await body(req);
       if (value.action === 'register_agent') return json(res, 200, agents.register({ identity: value.identity, secret: value.secret }));
       const actor = agents.authenticate(String(req.headers['x-agent-id'] ?? ''), String(req.headers['x-agent-token'] ?? ''));
@@ -226,10 +240,36 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, result);
     }
     if (route.startsWith('/api/')) {
-      if (!auth(req, uiToken)) return json(res, 401, { error: '请使用启动时提供的界面链接' });
-      if (route === '/api/shutdown' && req.method === 'POST') {
-        json(res, 200, { ok: true }); setTimeout(() => void shutdown(), 50); return;
+      if (route === '/api/pair-code' || route === '/api/shutdown') {
+        if (!localManagement(req) || !auth(req, adminToken)) return json(res, 401, { error: '本机管理认证失败' });
+        if (req.method !== 'POST') return json(res, 405, { error: '请求方法不被允许' });
+        if (shuttingDown) return json(res, 503, { error: '服务正在停止' });
+        if (route === '/api/shutdown') {
+          json(res, 200, { ok: true }); setTimeout(() => void shutdown(), 50); return;
+        }
+        const code = pairing?.issue();
+        if (!code) return json(res, 429, { error: '未使用的配对码过多，请稍后再试。' });
+        return json(res, 200, { code });
       }
+      if (!['GET', 'HEAD'].includes(req.method ?? '') && !localRequestOrigin(req, true)) {
+        return json(res, 403, { error: '来源不被允许' });
+      }
+      const hostname = new URL(origin).hostname;
+      if (route === '/api/pair' && req.method === 'POST') {
+        if (!pairing?.allowAttempt()) {
+          res.setHeader('Retry-After', '60');
+          return json(res, 429, { error: '配对请求过多，请稍后重试。' });
+        }
+        let code: unknown;
+        try { code = (await body(req, 1024))?.code; }
+        catch { return json(res, 400, { error: pairingError }); }
+        const cookie = pairing.redeem(code, hostname);
+        if (!cookie) return json(res, 400, { error: pairingError });
+        res.setHeader('Set-Cookie', cookie);
+        return empty(res);
+      }
+      if (!pairing?.expiresAt(req.headers.cookie, hostname)) return json(res, 401, { error: '请先配对浏览器。' });
+      if (route === '/api/auth' && req.method === 'GET') return empty(res);
       if (route === '/api/state' && req.method === 'GET') return json(res, 200, { profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
       if (route === '/api/ssh-config' && req.method === 'GET') return json(res, 200, await readSshConfig());
       if (route === '/api/profiles' && req.method === 'POST') {
@@ -252,41 +292,23 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 server.on('upgrade', (req, socket, head) => {
-  if (!localRequestOrigin(req, true) || req.url !== '/terminal') { socket.destroy(); return; }
-  wss.handleUpgrade(req, socket, head, ws => wss.emit('connection', ws));
+  const origin = localRequestOrigin(req, true);
+  if (!origin || req.url !== '/terminal') { socket.destroy(); return; }
+  const expiry = pairing?.expiresAt(req.headers.cookie, new URL(origin).hostname);
+  if (!expiry) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return; }
+  wss.handleUpgrade(req, socket, head, ws => attachBrowser(ws, expiry));
 });
-wss.on('connection', ws => {
+function attachBrowser(ws: WebSocket, expiry: number) {
   const clientId = randomUUID();
-  let authenticated = false;
-  let queue = Promise.resolve();
-  const timeout = setTimeout(() => ws.close(1008, '需要认证'), 5000);
+  const timeout = setTimeout(() => ws.close(1008, '配对已过期'), Math.max(0, expiry - Date.now()));
+  let queue = syncBrowser(ws, clientId).catch(() => { ws.close(1011, '同步失败'); });
   ws.on('message', raw => {
     queue = queue.then(async () => {
       let requestId: string | undefined;
       try {
         const p = JSON.parse(raw.toString());
         requestId = p.requestId;
-        if (!authenticated) {
-          if (p.type !== 'auth' || typeof p.token !== 'string' || !equal(p.token, uiToken)) { ws.close(1008, '认证失败'); return; }
-          authenticated = true; clearTimeout(timeout);
-          const pending: any[] = [];
-          synchronizing.set(ws, pending);
-          send(ws, { type: 'hello', uiVersion, clientId, profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
-          const boundaries = new Map<string, number>();
-          for (const s of sessions.values()) {
-            const snapshot = await s.snapshot();
-            boundaries.set(s.id, snapshot.sequence);
-            send(ws, { type: 'snapshot', sessionId: s.id, ...snapshot });
-            send(ws, { type: 'messages', sessionId: s.id, messages: messages.list(s.id) });
-          }
-          synchronizing.delete(ws);
-          for (const event of pending) {
-            if (!['output', 'reset', 'resize'].includes(event.type) || event.uiSeq > (boundaries.get(event.sessionId) ?? -1)) send(ws, event);
-          }
-          sockets.add(ws);
-          send(ws, { type: 'synced', sessions: [...sessions.values()].map(s => s.summary()) });
-          return;
-        }
+        if (ws.readyState !== WebSocket.OPEN || Date.now() >= expiry) return;
         if (typeof requestId !== 'string') throw new Error('请求缺少标识');
         let result: unknown = { ok: true };
         if (p.type === 'create') result = (await createSession(z.string().uuid().parse(p.profileId), clientId)).summary();
@@ -328,7 +350,29 @@ wss.on('connection', ws => {
   });
   ws.on('error', () => {});
   ws.on('close', () => { clearTimeout(timeout); sockets.delete(ws); synchronizing.delete(ws); });
-});
+}
+
+async function syncBrowser(ws: WebSocket, clientId: string) {
+  const pending: any[] = [];
+  synchronizing.set(ws, pending);
+  try {
+    send(ws, { type: 'hello', uiVersion, clientId, profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
+    const boundaries = new Map<string, number>();
+    for (const s of sessions.values()) {
+      const snapshot = await s.snapshot();
+      boundaries.set(s.id, snapshot.sequence);
+      send(ws, { type: 'snapshot', sessionId: s.id, ...snapshot });
+      send(ws, { type: 'messages', sessionId: s.id, messages: messages.list(s.id) });
+    }
+    if (ws.readyState !== WebSocket.OPEN) return;
+    for (const event of pending) {
+      if (!['output', 'reset', 'resize'].includes(event.type) || event.uiSeq > (boundaries.get(event.sessionId) ?? -1)) send(ws, event);
+    }
+    if (ws.readyState !== WebSocket.OPEN) return;
+    sockets.add(ws);
+    send(ws, { type: 'synced', sessions: [...sessions.values()].map(s => s.summary()) });
+  } finally { synchronizing.delete(ws); }
+}
 
 async function main() {
   const requestedPort = configuredPort();
@@ -339,11 +383,12 @@ async function main() {
     await mkdir(DATA, { recursive: true, mode: 0o700 });
     try { await profiles.load(); }
     catch { throw new RuntimeError('无法加载本机服务器配置。请检查配置文件格式和目录权限，修复后重试。'); }
+    try { pairing = new Pairing(await loadPairingKey(paths.pairingKey), serviceLock.id); }
+    catch { throw new RuntimeError('无法加载配对签名密钥。请检查运行目录的 pairing-key.json。'); }
     const { address, port } = await listenLocal(server, requestedPort);
     const url = `http://${address}:${port}`;
-    const uiUrl = `${url}/#${uiToken}`;
     instance = { service: SERVICE_NAME, runtime: serviceLock.id, pid: process.pid, address, port };
-    await writeRuntimeJson(paths.ui, { url: uiUrl });
+    await writeRuntimeJson(paths.ui, { adminToken });
     uiPublished = true;
     await writeRuntimeJson(paths.connection, { url, agentToken, pid: process.pid, address, port });
     console.log(`共享 SSH 终端已启动 (${address}:${port})`);
@@ -358,7 +403,7 @@ async function shutdown() {
   if (shuttingDown) return; shuttingDown = true;
   try { await startup; } catch { return; }
   for (const s of sessions.values()) s.close();
-  for (const ws of sockets) ws.close(1001, '服务停止');
+  for (const ws of wss.clients) ws.close(1001, '服务停止');
   server.close(); wss.close();
   await Promise.all([paths.connection, paths.ui].map(file => unlink(file).catch(() => {})));
   await serviceLock?.release().catch(() => {});

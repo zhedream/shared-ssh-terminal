@@ -74,9 +74,9 @@ function request(type, args = {}) {
   });
 }
 async function input(id, data) { return request('input', { sessionId: id, data, revision: states.get(id).revision }); }
-async function replica(sessionId, uiToken) {
+async function replica(sessionId, cookie) {
   const terminal = new headless.Terminal({ cols: 100, rows: 30, scrollback: 2000, allowProposedApi: true });
-  const connection = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: { Origin: agent.url } });
+  const connection = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: { Origin: agent.url, Cookie: cookie } });
   let queue = Promise.resolve(), synced = false;
   connection.on('message', raw => {
     const p = JSON.parse(raw.toString());
@@ -90,7 +90,6 @@ async function replica(sessionId, uiToken) {
       else if (p.type === 'output') await new Promise(resolve => terminal.write(p.data, resolve));
     });
   });
-  await new Promise(resolve => connection.on('open', resolve)); connection.send(JSON.stringify({ type: 'auth', token: uiToken }));
   await until(() => synced, 'terminal replica replay');
   return {
     async text() {
@@ -117,13 +116,20 @@ try {
   agent = JSON.parse(await readFile(path.join(env.SHARED_SSH_RUNTIME_DIR, 'connection.json'), 'utf8'));
   assert.equal(agent.address, '127.0.0.1');
   assert.equal(agent.url, `http://${agent.address}:${agent.port}`);
-  const uiToken = new URL(ui.url).hash.slice(1);
-  const create = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: { Authorization: `Bearer ${uiToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '本机 SSH 测试', host: '127.0.0.1', port: sshPort, username: 'test-user', auth: 'password', note: '临时测试' }) });
+  const issued = await fetch(agent.url + '/api/pair-code', { method: 'POST', headers: { Authorization: `Bearer ${ui.adminToken}` } });
+  assert.equal(issued.status, 200);
+  const { code } = await issued.json();
+  const redeemed = await fetch(agent.url + '/api/pair', { method: 'POST', headers: { Origin: agent.url, 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) });
+  assert.equal(redeemed.status, 204);
+  const cookie = redeemed.headers.get('set-cookie').split(';')[0];
+  const browserHeaders = { Origin: agent.url, Cookie: cookie };
+  const profileHeaders = { ...browserHeaders, 'Content-Type': 'application/json' };
+  const create = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: profileHeaders, body: JSON.stringify({ name: '本机 SSH 测试', host: '127.0.0.1', port: sshPort, username: 'test-user', auth: 'password', note: '临时测试' }) });
   assert.equal(create.status, 200); const profile = await create.json();
   // Boundary checks: wrong bearer and unrelated Origin cannot reach either control surface.
   assert.equal((await fetch(agent.url + '/agent', { method: 'POST', body: '{}' })).status, 401);
-  assert.equal((await fetch(agent.url + '/api/state', { headers: { Authorization: `Bearer ${uiToken}`, Origin: 'https://unrelated.invalid' } })).status, 403);
-  ws = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: { Origin: agent.url } });
+  assert.equal((await fetch(agent.url + '/api/state', { headers: { Cookie: cookie, Origin: 'https://unrelated.invalid' } })).status, 403);
+  ws = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: browserHeaders });
   ws.on('message', raw => {
     const p = JSON.parse(raw.toString());
     if (p.type === 'hello') clientId = p.clientId;
@@ -138,7 +144,6 @@ try {
       p.type === 'ack' ? item.resolve(p.result) : item.reject(new Error(p.error));
     }
   });
-  await new Promise(resolve => ws.on('open', resolve)); ws.send(JSON.stringify({ type: 'auth', token: uiToken }));
   await until(() => ready, 'UI WebSocket ready');
   transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'dist/mcp.js')], cwd: root, env });
   client = new Client({ name: 'shared-ssh-e2e', version: '1.0.0' }); await client.connect(transport);
@@ -163,7 +168,7 @@ try {
   assert((await readFile(path.join(env.SHARED_SSH_DATA_DIR, 'known_hosts'), 'utf8')).includes('ssh-rsa'));
   // Saved credentials use OpenSSH askpass, never terminal typing. A different
   // hostname exercises first-use fingerprint confirmation on the same test SSH.
-  const savedResponse = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: { Authorization: `Bearer ${uiToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '保存密码测试', host: 'localhost', port: sshPort, username: 'test-user', auth: 'password', savePassword: true, password: 'local-test-password' }) });
+  const savedResponse = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: profileHeaders, body: JSON.stringify({ name: '保存密码测试', host: 'localhost', port: sshPort, username: 'test-user', auth: 'password', savePassword: true, password: 'local-test-password' }) });
   assert.equal(savedResponse.status, 200); const savedProfile = await savedResponse.json();
   assert(savedProfile.savePassword); assert(!JSON.stringify(savedProfile).includes('local-test-password'));
   const diskProfiles = await readFile(path.join(env.SHARED_SSH_DATA_DIR, 'profiles.json'), 'utf8');
@@ -184,7 +189,7 @@ try {
   assert(!JSON.stringify(savedScreen).includes('local-test-password'));
   assert(!JSON.stringify(savedScreen).includes('password:'));
   await request('close', { sessionId: savedAgain.id });
-  const wrongResponse = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: { Authorization: `Bearer ${uiToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ ...savedProfile, password: 'deliberately-wrong-password' }) });
+  const wrongResponse = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: profileHeaders, body: JSON.stringify({ ...savedProfile, password: 'deliberately-wrong-password' }) });
   assert.equal(wrongResponse.status, 200);
   const wrongSession = await request('create', { profileId: savedProfile.id });
   await until(() => (perSessionOutput.get(wrongSession.id) || '').includes('保存的密码未被接受'), 'wrong saved password asks user instead of typing into the terminal');
@@ -193,7 +198,7 @@ try {
   await until(() => (perSessionOutput.get(wrongSession.id) || '').includes('test-shell>'), 'manual retry after saved password failure');
   assert(!(perSessionOutput.get(wrongSession.id) || '').includes('local-test-password'));
   await request('close', { sessionId: wrongSession.id });
-  const privateView = await replica(id, uiToken);
+  const privateView = await replica(id, cookie);
   assert((await privateView.text()).includes('test-shell>')); await privateView.close();
   await request('privacy', { sessionId: id, privateMode: false });
   await call('attach_session', { sessionId: id });
@@ -301,11 +306,11 @@ try {
   await call('send_input', { sessionId: id, lease: offline.lease, data: 'printf "OFFLINE:%s\\n" "$SST_SHARED_VALUE"\r' });
   await expectLine(client, id, 'OFFLINE:manual-shared');
   await call('release_control', { sessionId: id, lease: offline.lease });
-  const a = await replica(id, uiToken), b = await replica(id, uiToken);
+  const a = await replica(id, cookie), b = await replica(id, cookie);
   try { await new Promise(r => setTimeout(r, 100)); const text = await readText(client); assert.equal(await a.text(), text); assert.equal(await b.text(), text); }
   finally { await a.close(); await b.close(); }
-  ready = false; ws = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: { Origin: agent.url } });
-  ws.on('message', primaryHandler); await new Promise(r => ws.on('open', r)); ws.send(JSON.stringify({ type: 'auth', token: uiToken }));
+  ready = false; ws = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: browserHeaders });
+  ws.on('message', primaryHandler);
   await until(() => ready, 'browser reconnected');
   // Transfer an already-running key-driven application from user to Agent.
   await input(id, 'printf "\\033[?1049hUSER-PROGRAM\\r\\n"; IFS= read -r -s -n 1 KEY; printf "\\033[?1049l\\nUSER-KEY:%s\\n" "$KEY"\r');
@@ -338,7 +343,7 @@ try {
   await callWith(clientB, 'release_control', { sessionId: id, lease: bControl.lease });
   await call('attach_session', { sessionId: id });
   // Key login starts immediately usable, without Shell hooks or initialization.
-  const keyResponse = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: { Authorization: `Bearer ${uiToken}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '本机密钥测试', host: '127.0.0.1', port: sshPort, username: 'test-user', auth: 'key', identityFile, note: '临时密钥' }) });
+  const keyResponse = await fetch(agent.url + '/api/profiles', { method: 'POST', headers: profileHeaders, body: JSON.stringify({ name: '本机密钥测试', host: '127.0.0.1', port: sshPort, username: 'test-user', auth: 'key', identityFile, note: '临时密钥' }) });
   const keyProfile = await keyResponse.json();
   const second = await call('create_session', { profileId: keyProfile.id });
   assert.equal(second.lock, null); assert.equal(second.privateMode, false);
@@ -361,7 +366,7 @@ try {
   await request('privacy', { sessionId: id, privateMode: false });
   assert((await readText(client)).includes('AGENT-READY'));
   await request('clear-history', { sessionId: id }); assert(!(await readText(client)).includes('AGENT-READY'));
-  const cleared = await replica(id, uiToken); assert(!(await cleared.text()).includes('AGENT-READY')); await cleared.close();
+  const cleared = await replica(id, cookie); assert(!(await cleared.text()).includes('AGENT-READY')); await cleared.close();
   // Two task identities within one MCP process remain distinct.
   const taskOne = await call('register_agent', { name: 'task one', project: 'one' });
   const taskTwo = await call('register_agent', { name: 'task two', project: 'two' });
@@ -370,18 +375,17 @@ try {
   assert.deepEqual(await call('list_sessions', { agentId: taskTwo.id }), []);
   await request('close', { sessionId: third.id }); await request('close', { sessionId: second.id });
   await assert.rejects(request('dismiss-tab', { sessionId: id }), /先关闭/);
-  browserTwo = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: { Origin: agent.url } });
+  browserTwo = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: browserHeaders });
   let observerReady = false, observerClosed = false, observerDismissed = false;
   browserTwo.on('message', raw => { const p = JSON.parse(raw.toString());
     if (p.type === 'synced') observerReady = true;
     if (p.type === 'state' && p.session.id === id && p.session.status === 'closed') observerClosed = true;
     if (p.type === 'dismissed' && p.sessionId === id) observerDismissed = true;
   });
-  await new Promise(r => browserTwo.on('open', r)); browserTwo.send(JSON.stringify({ type: 'auth', token: uiToken }));
   await until(() => observerReady, 'close observer ready');
   await request('close', { sessionId: id }); await until(() => observerClosed, 'close pushed to another page');
   await callWith(clientB, 'attach_session', { sessionId: id });
-  const closedView = await replica(id, uiToken); assert.equal(await closedView.text(), await readText(clientB)); await closedView.close();
+  const closedView = await replica(id, cookie); assert.equal(await closedView.text(), await readText(clientB)); await closedView.close();
   await callWith(clientB, 'take_control', { sessionId: id }, true);
   await request('privacy', { sessionId: id, privateMode: true }); await callWith(clientB, 'read_screen', { sessionId: id }, true);
   await request('dismiss-tab', { sessionId: id }); await until(() => observerDismissed, 'dismiss pushed to another page');

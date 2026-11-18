@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, open, readFile, realpath, unlink } from 'node:fs/promises';
+import { request } from 'node:http';
 import { createConnection, createServer } from 'node:net';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
@@ -132,18 +133,38 @@ async function readConnection(paths: ServicePaths) {
   return result.success ? result.data : undefined;
 }
 
+function loopbackRequest(connection: ServiceConnection, route: string, token: string, method: 'GET' | 'POST', signal: AbortSignal) {
+  return new Promise<{ status: number; body: string }>((resolve, reject) => {
+    // Connect directly so process proxy settings cannot forward local credentials.
+    const req = request({
+      hostname: LOCAL_ADDRESS, port: connection.port, path: route, method, signal, agent: false,
+      headers: { Authorization: `Bearer ${token}` },
+    }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => {
+        body += chunk;
+        if (body.length > 4096) req.destroy(new RuntimeError('本机管理响应过大。'));
+      });
+      response.on('error', reject);
+      response.on('end', () => resolve({ status: response.statusCode ?? 0, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 export async function findService(paths: ServicePaths, signal?: AbortSignal): Promise<ServiceConnection | undefined> {
   const connection = await readConnection(paths);
   if (!connection) return;
   const id = await runtimeId(paths);
   if (!id) return;
   try {
-    const response = await fetch(`${connection.url}/agent/instance`, {
-      headers: { Authorization: `Bearer ${connection.agentToken}` }, redirect: 'error',
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(750)]) : AbortSignal.timeout(750),
-    });
-    if (!response.ok) { await response.body?.cancel(); return; }
-    const { service, runtime, pid, address, port } = await response.json();
+    const timeout = AbortSignal.timeout(750);
+    const response = await loopbackRequest(connection, '/agent/instance', connection.agentToken, 'GET',
+      signal ? AbortSignal.any([signal, timeout]) : timeout);
+    if (response.status !== 200) return;
+    const { service, runtime, pid, address, port } = JSON.parse(response.body);
     if (service === SERVICE_NAME && runtime === id && pid === connection.pid && address === connection.address && port === connection.port) {
       return connection;
     }
@@ -200,23 +221,22 @@ export async function ensureService(paths: ServicePaths, signal?: AbortSignal) {
   throw new RuntimeError('本地服务未在等待时间内就绪。请检查运行目录的 service.stderr.log，或确认目录是否仍由原实例使用。');
 }
 
-async function uiCredential(paths: ServicePaths, connection: ServiceConnection) {
-  const ui = z.object({ url: z.string() }).safeParse(await readJson(paths.ui));
-  const prefix = `${connection.url}/#`;
-  if (!ui.success || !ui.data.url.startsWith(prefix) || !bearerSchema.safeParse(ui.data.url.slice(prefix.length)).success) {
-    throw new RuntimeError('UI 启动信息与已验证的本地服务不符。请核对运行目录，或用原入口停止后重试。');
-  }
-  return { url: ui.data.url, token: ui.data.url.slice(prefix.length) };
+async function managementToken(paths: ServicePaths) {
+  const result = z.object({ adminToken: bearerSchema }).safeParse(await readJson(paths.ui));
+  if (!result.success) throw new RuntimeError('本机管理信息无效。请核对运行目录和服务版本。');
+  return result.data.adminToken;
 }
 
-export async function browserUrl(paths: ServicePaths, connection: ServiceConnection) {
-  const { url, token } = await uiCredential(paths, connection);
-  const response = await fetch(`${connection.url}/api/state`, {
-    headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(3000),
-  });
-  await response.body?.cancel();
-  if (!response.ok) throw new RuntimeError('页面启动凭据无效。请核对运行目录后重试。');
-  return url;
+export async function pairingUrl(paths: ServicePaths, connection: ServiceConnection) {
+  const token = await managementToken(paths);
+  const response = await loopbackRequest(connection, '/api/pair-code', token, 'POST', AbortSignal.timeout(3000));
+  if (response.status !== 200) {
+    if (response.status === 429) throw new RuntimeError('未使用的配对码过多，请稍后再试。');
+    throw new RuntimeError('本机服务拒绝签发配对码。请核对运行目录和服务版本。');
+  }
+  const result = z.object({ code: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).safeParse(JSON.parse(response.body));
+  if (!result.success) throw new RuntimeError('本机服务返回的配对信息无效。');
+  return `${connection.url}/#pair=${result.data.code}`;
 }
 
 export async function stopService(paths: ServicePaths) {
@@ -226,12 +246,9 @@ export async function stopService(paths: ServicePaths) {
     if (!status.running) return false;
     throw new RuntimeError('服务状态正在变化。请重新执行 stop。');
   }
-  const { token } = await uiCredential(paths, service);
-  const response = await fetch(`${service.url}/api/shutdown`, {
-    method: 'POST', headers: { Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(3000),
-  });
-  await response.body?.cancel();
-  if (!response.ok) throw new RuntimeError('服务拒绝关闭请求。请核对运行目录和实例状态。');
+  const token = await managementToken(paths);
+  const response = await loopbackRequest(service, '/api/shutdown', token, 'POST', AbortSignal.timeout(3000));
+  if (response.status !== 200) throw new RuntimeError('服务拒绝关闭请求。请核对运行目录和实例状态。');
   const deadline = Date.now() + 5000;
   do {
     const current = await readConnection(paths);

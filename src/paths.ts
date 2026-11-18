@@ -13,6 +13,7 @@ export function servicePaths(env = process.env, home = homedir()) {
     owner: path.join(runtime, 'owner.json'),
     connection: path.join(runtime, 'connection.json'),
     ui: path.join(runtime, 'ui.json'),
+    pairingKey: path.join(runtime, 'pairing-key.json'),
     stdout: path.join(runtime, 'service.stdout.log'),
     stderr: path.join(runtime, 'service.stderr.log'),
   };
