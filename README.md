@@ -2,7 +2,7 @@
 
 共用同一个真实 SSH 会话：共享画面、独占输入、随时交接。浏览器供用户操作，MCP 供 Agent 操作，双方读取同一份终端画面与最多 2000 行滚动历史。
 
-Windows 为当前已验证平台，Linux 本机回环实现等待原生验收。项目尚未选择开源许可证。[文档索引](docs/README.md) · [开发章程](AGENTS.md)
+Windows 和原生 Linux 本机回环均已通过验收。项目尚未选择开源许可证。[文档索引](docs/README.md) · [开发章程](AGENTS.md)
 
 ## 操作规则
 
@@ -38,9 +38,9 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 
 从本地包安装后使用 `shared-ssh-terminal server` 启动或复用服务，`shared-ssh-terminal status` 查看实际地址与端口，`shared-ssh-terminal mcp` 供 MCP 客户端启动 stdio 适配端。在源码目录构建后，可用 `node dist/cli.js` 加同样的子命令。`stop` 会停止当前运行目录的服务并关闭其所有 SSH 会话。
 
-Linux 回环候选使用 Node CLI 和原生 OpenSSH。用 `pair` 生成配对链接并手动打开，登录可在终端输入密码或选择本机私钥。已从 Windows 带来的保存密码配置应保留原件并另建 Linux 登录配置。[Linux 环境和复跑命令](docs/development.md#linux-回环候选)
+Linux 本机回环已在非 root 的原生 Linux x86_64 上通过 Node.js 22 和 24 验收。使用 Node CLI 和系统 OpenSSH，运行 `pair` 生成配对链接并手动打开。登录可在终端输入密码或选择本机私钥。已有 Windows 保存密码的配置可保留，另建 Linux 登录配置。[Linux 环境、验收结果与复跑命令](docs/development.md#linux-回环)
 
-本机浏览器可用 `shared-ssh-terminal pair` 重新获取五分钟有效的一次性链接。要让同一可信局域网中的浏览器访问，配置 HTTPS 监听和证书后运行 `shared-ssh-terminal pair --lan`。各已配对浏览器共享同一服务的 SSH 会话。[局域网 HTTPS 配置](docs/development.md#局域网-https)
+本机浏览器可用 `shared-ssh-terminal pair` 重新获取五分钟有效的一次性链接。Windows 主机可配置 HTTPS 监听和证书，随后运行 `shared-ssh-terminal pair --lan`，让同一可信局域网中的浏览器访问。各已配对浏览器共享同一服务的 SSH 会话。[局域网 HTTPS 配置](docs/development.md#局域网-https)
 
 两个输入按钮始终同时展示：
 
@@ -129,7 +129,8 @@ MCP 标准通知只提示有新消息，正文通过任务身份读取；是否�
 
 - `node node_modules/typescript/bin/tsc`：构建。
 - `node --import tsx --test test/*.test.ts`：权限、唯一锁、显式释放、无注入、私密、保留历史、清空、输入按钮状态和配置导入。
-- `node scripts/e2e.mjs`：隔离的本机 OpenSSH/SSH2/ConPTY/MCP 测试。覆盖密码和密钥登录、真实 Vim 增删改查保存、多页面逐字一致、网页全部离线、多个 Agent 的运行中交接，以及关闭／移除同步。
+- `node scripts/e2e.mjs` 运行隔离的 Windows OpenSSH/SSH2/ConPTY/MCP 测试。覆盖密码和密钥登录、真实 Vim 增删改查保存、多页面逐字一致、网页全部离线、多个 Agent 的运行中交接，以及关闭／移除同步。
+- `node scripts/linux-e2e.mjs` 在原生 Linux 运行回环验收，覆盖 Unix PTY、密码和私钥、终端缩放后输入及实例重启。[Linux 复跑命令](docs/development.md#原生复跑)
 - `node scripts/shell-smoke.mjs`：本机原始终端测试。设置 `SST_TEST_ZSH` 可同时验证本地 Zsh；不安装任何 Shell 回调。
 
 从旧版升级需要重新连接 SSH。旧 Shell 内曾安装的回调会随该 Shell 退出而消失；新版不再安装。已经写入服务器的旧命令历史不会自动删除。

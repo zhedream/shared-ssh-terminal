@@ -14,11 +14,28 @@ npm run test:e2e
 
 `start.cmd` 在首次缺少 CLI 构建产物时先构建，再启动或复用后台服务并打开默认浏览器。源码更新后可先运行 `npm run build`。`stop.cmd` 停止当前运行目录的服务，关闭该实例的所有 SSH。构建文件在 dist，安装依赖在 node_modules，均不提交。
 
-## Linux 回环候选
+<a name="linux-回环候选"></a>
 
-在原生 Linux 用 Node.js 22 或 24、npm 和系统 OpenSSH 客户端验收。`node-pty` 在 Linux 需要本机构建工具。准备 Python 3、`make`、C/C++ 编译器和可用的 Node 头文件。测试还使用 `/bin/sh`、`stty`、`/dev/pts` 和 IPv4 回环。以下命令从干净候选源码目录运行，只使用各测试自建的临时配置和回环夹具。先确认测试 shell 无继承的 `SHARED_SSH_LAN_*` 设置。
+## Linux 回环
 
-```sh
+原生验收基线为 `59fafc0`，使用非 root 账户、Linux 6.12 x86_64、OpenSSH 9.6p1 和本机编译的 `node-pty` 1.1.0。两版 Node.js 均通过依赖安装、TypeScript 构建和文档索引检查。
+
+| Node.js | 完整 `npm test` | 真实回环 SSH E2E |
+| --- | --- | --- |
+| 22.23.4 | 78 项，76 通过，0 失败，2 跳过 | 连续 10/10 通过 |
+| 24.22.3 | 78 项，76 通过，0 失败，2 跳过 | 连续 10/10 通过 |
+
+两版均按平台跳过 Windows 局域网双监听和 DPAPI 用例。Linux E2E 从另一个目录通过绝对 CLI 路径验证 `server`、`status`、`pair`、`stop` 和 `mcp`，覆盖手动密码与私钥登录、两路浏览器 WebSocket 同步、PTY 缩放后输入及实例重启。既有 Windows 保存密码配置的编辑被拒，配置和密文保持原样。
+
+日常在本机用 `pair` 输出一次性链接，手动打开浏览器。首次确认主机指纹后，在终端输入密码或使用指定私钥。已有 Windows 保存密码配置仍可在原 Windows 账户使用。在 Linux 的「服务器 → 添加服务器」另建手动登录配置。Linux 仅支持回环，局域网 HTTPS、自动打开默认浏览器和保存密码的本机凭据提供者仍限于现有 Windows 实现。
+
+### 原生复跑
+
+在原生 Linux 准备 Node.js 22 或 24、npm、系统 OpenSSH、Python 3、`make`、C/C++ 编译器及可用的 Node 头文件。测试还使用 `/bin/sh`、`stty`、`/dev/pts` 和 IPv4 回环。从干净源码目录用非 root 账户在 Bash 中运行，分别切换两版 Node.js，复用下列命令。各测试使用自建的临时配置和回环夹具。
+
+```bash
+set -e
+for name in ${!SHARED_SSH_LAN_@}; do unset "$name"; done
 uname -srmo
 node --version
 npm --version
@@ -26,12 +43,19 @@ ssh -V
 npm ci
 node -e 'const assert = require("node:assert/strict"); assert.equal(process.platform, "linux"); assert.equal(typeof require("node-pty").spawn, "function")'
 npm run build
-node --import tsx --test test/local-network.test.ts test/service-runtime.test.ts test/profiles.test.ts test/pairing.test.ts
-node scripts/linux-e2e.mjs
+npm test
 npm run check:docs
+for attempt in {1..10}; do
+  printf 'Linux E2E %s/10\n' "$attempt"
+  node scripts/linux-e2e.mjs
+done
 ```
 
-Linux 夹具从另一个目录用绝对 CLI 路径测试 `server`、`status`、`pair`、`stop` 和 `mcp`，并验证两路 WS、密码／私钥、PTY 缩放以及实例重启。日常在本机用 `pair` 输出的地址手动打开浏览器。首次确认主机指纹后，在终端输入密码或使用指定私钥。若已有 Windows 保存密码配置，使用原 Windows 账户，或在「服务器 → 添加服务器」另建手动配置。Linux 当前回环候选的原生实测组合待云端验收。
+仅排查配对、服务发现和配置时，可复跑定向测试。
+
+```sh
+node --import tsx --test test/local-network.test.ts test/service-runtime.test.ts test/profiles.test.ts test/pairing.test.ts
+```
 
 ## 本机配置与旧目录
 
@@ -76,7 +100,7 @@ Codex 和 Cursor 共用两者都可发现的薄技能。各客户端分别登记
 
 ## 局域网 HTTPS
 
-默认只在 IPv4 回环提供本机入口。要在同一个后台实例上增加局域网浏览器入口，在启动者的环境中同时设置以下五项。证书和私钥的相对路径按启动调用时的工作目录解析。
+默认只在 IPv4 回环提供本机入口。Windows 可在同一个后台实例上增加局域网浏览器入口，由启动者在环境中同时设置以下五项。证书和私钥的相对路径按启动调用时的工作目录解析。
 
 | 环境变量 | 值 |
 | --- | --- |
@@ -141,12 +165,12 @@ if ($resolvedFixture.StartsWith($fixturePrefix, [StringComparison]::OrdinalIgnor
 | npm run build | TypeScript 类型和输出 |
 | npm test | 本机与局域网端口、发现、配对、HTTP／WS 权限、并发 CLI／MCP 首连与重连、会话及按钮状态。局域网集成测试使用临时证书、OpenSSL 和具体私有 IPv4 接口 |
 | npm run test:e2e | Windows 本机 OpenSSH/SSH2/ConPTY、密码/密钥/保存密码、真实 Vim、跨页面、多个 MCP 进程、独立消息与标准通知、同实例浏览器重连和服务重启后显式新建 SSH |
-| node scripts/linux-e2e.mjs | 原生 Linux 候选的回环 CLI、配对、Unix PTY、手动密码/测试私钥、两路 WS/MCP、进程退出及重启 |
+| node scripts/linux-e2e.mjs | 原生 Linux 的回环 CLI、配对、Unix PTY、手动密码/测试私钥、两路 WS/MCP、缩放后输入、进程退出及重启 |
 | node scripts/shell-smoke.mjs | 本机 Bash 原始输入；设置 SST_TEST_ZSH 可加测 Zsh |
 | npm run check:docs | 所有文档索引和相对引用 |
 | npm run check:publish | Git 暂存版本中的私密目录、主机、本机路径和常见凭据 |
 
-端到端测试使用系统临时目录、首选服务端口 43128 和动态本机 SSH 端口。完整测试还需 Git for Windows 的 Bash／Vim。ConPTY 测试清理时偶尔会出现 node-pty 的 AttachConsole 错误输出，需结合断言与退出码判断。
+端到端测试使用系统临时目录和动态本机 SSH 端口。Windows E2E 还覆盖首选服务端口被占用时的回退，并使用 Git for Windows 的 Bash／Vim。ConPTY 测试清理时偶尔会出现 node-pty 的 AttachConsole 错误输出，需结合断言与退出码判断。
 
 ## 修改入口
 

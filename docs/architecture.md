@@ -19,7 +19,7 @@ Agent 应用 B ── stdio MCP ── 适配进程 B ─┼── HTTP ── �
 
 每个 Session 有唯一 id、创建来源、关联 Agent、私密状态、输入锁、人工交接状态、终端尺寸、状态修订和 historyEpoch。PTY 输出写入 headless xterm 后才广播给页面。Agent 屏幕快照排在同一渲染队列中，避免读到尚未完成解析的内容。
 
-新页面先完成鉴权，在 WS `hello` 收到与认证探测一致的 `instanceId`，接收会话快照和消息历史，再补发快照期间缓存的状态事件。此 ID 每个服务进程生成一次，是非秘密 UUID。同一浏览器页面在成功收到 `synced` 后才记录并比较实例 ID 和会话清单。revision 和 sequence 用于区别控制状态与终端输出。输入串行确认，冲突、断线或超时后不会自动重试，避免重复执行。
+新页面先完成鉴权，在 WS `hello` 收到与认证探测一致的 `instanceId`，接收会话快照和消息历史，再补发快照期间缓存的状态事件。此 ID 每个服务进程生成一次，是非秘密 UUID。同一浏览器页面在成功收到 `synced` 后才记录并比较实例 ID 和会话清单。revision 和 sequence 用于区别控制状态与终端输出。调整尺寸时，服务先更新 canonical xterm，广播新尺寸和新 revision，再回复该请求的成功回执。输入串行确认，冲突、断线或超时后不会自动重试，避免重复执行。
 
 MCP 读取不再复用浏览器完整恢复快照。TerminalReader 为每个任务保留最近观察画面的行哈希，最多 64 个任务基线，超出后淘汰最旧基线并在下次重新给出受限快照；不保留旧正文。普通屏幕行标记辅助追踪滚动淘汰，备用屏幕按位置比较；无法可靠延续、清空或切屏时明确重同步。
 
@@ -41,7 +41,7 @@ MCP 适配进程为每个项目或聊天 `register_agent`，产生独立任务 I
 
 ## SSH 配置与密码
 
-profiles 独立维护，SSH config 导入只复制允许字段，不执行 Match exec 或 ProxyCommand。Windows 使用 ConPTY、`ssh.exe` 和 `-F NUL`。Linux 回环候选使用 Unix PTY、从 `PATH` 的绝对目录选择可执行的 `ssh`，并传入 `-F /dev/null`。两平台用显式参数传递连接信息并由用户确认首次主机指纹。Linux 在实例 data 目录打开 `./known_hosts`，全局已知主机文件指向 `/dev/null`。
+profiles 独立维护，SSH config 导入只复制允许字段，不执行 Match exec 或 ProxyCommand。Windows 使用 ConPTY、`ssh.exe` 和 `-F NUL`。Linux 回环使用 Unix PTY，从 `PATH` 的绝对目录选择可执行的 `ssh`，并传入 `-F /dev/null`。两平台用显式参数传递连接信息并由用户确认首次主机指纹。Linux 在实例 data 目录打开 `./known_hosts`，全局已知主机文件指向 `/dev/null`。[Linux 原生验收范围](development.md#linux-回环)
 
 手动密码和密钥口令沿用 OpenSSH 的交互。已保存的密码通过 Windows DPAPI CurrentUser 加密；服务只在认证时解密，经随机能力令牌保护的本机命名管道交给 askpass 小组件。密码不进入环境变量、进程参数、原始 PTY 输入或工具返回。
 
@@ -57,4 +57,4 @@ Messages 模块只存有界内存数据，每会话最多 100 条。发送固定
 
 ## 部署边界
 
-配对浏览器具备操作共享会话的权限，适合获准共同操作 SSH 的成员。Windows 的额外 HTTPS 监听面向可信局域网。Linux 候选只绑定回环，设置 `SHARED_SSH_LAN_*` 时会提示如何启动回环实例。[私密资料与公开发布](security.md)
+配对浏览器具备操作共享会话的权限，适合获准共同操作 SSH 的成员。Windows 的额外 HTTPS 监听面向可信局域网。Linux 只绑定回环，设置 `SHARED_SSH_LAN_*` 时会拒绝启动并提示如何启动回环实例。[私密资料与公开发布](security.md)

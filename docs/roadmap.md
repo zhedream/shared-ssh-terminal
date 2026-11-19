@@ -43,7 +43,7 @@
 - 实际端口写入 `~/.shared-terminal/` 下的运行时文件（现为 `connection.json`），MCP、`status`、`pair` 都从中读取。
 - Host 校验按实际端口进行。
 - 本机模式下 `localhost` 与 `127.0.0.1` 都可配对。
-- 显式配置局域网接口与证书后开启 HTTPS／WSS 浏览器监听。启动提示可访问地址，MCP 与管理路径保持回环。[局域网 HTTPS](development.md#局域网-https)
+- Windows 显式配置局域网接口与证书后可开启 HTTPS／WSS 浏览器监听。启动提示可访问地址，MCP 与管理路径保持回环。[局域网 HTTPS](development.md#局域网-https)
 - 不建议暴露到公网。
 - 参考：T3 Code 的 [后台服务与本地网络访问](https://github.com/pingdotgg/t3code/blob/main/docs/user/background-service.md) 和 [远程访问与配对](https://github.com/pingdotgg/t3code/blob/main/docs/user/remote-access.md)。
 
@@ -73,10 +73,12 @@
 
 - 已认证的浏览器和 MCP 用每次启动生成的实例 ID 识别服务切换。仅浏览器掉线时可恢复同一实例里的原会话；服务更换实例后，用户明确发起新 SSH。会话、画面和消息仍随服务进程退出而消失。[服务实例变化与重连](development.md#服务实例变化与重连)
 
-## 8 跨平台（计划）
+<a name="8-跨平台计划"></a>
 
-- Windows 继续使用 ConPTY、`ssh.exe`、DPAPI/askpass 和旧入口。Linux 回环候选复用 Node CLI、Unix PTY 和原生 `ssh`，覆盖手动密码及私钥，等待云端原生运行验收。[Linux 复跑命令](development.md#linux-回环候选)
-- macOS、本机凭据提供者、Linux 默认浏览器及 LAN/HTTPS 留待独立排期。
+## 8 跨平台（Windows 与 Linux 回环已验收）
+
+- Windows 使用 ConPTY、`ssh.exe`、DPAPI/askpass 和旧入口。Linux 回环使用 Node CLI、Unix PTY 和原生 `ssh`，支持手动密码及私钥。非 root 原生 Linux x86_64 上，Node.js 22 和 24 分别通过完整测试及连续十轮回环 SSH 验收。[Linux 验收与复跑命令](development.md#linux-回环)
+- macOS 适配、Linux 自动打开默认浏览器和 LAN/HTTPS，以及 Windows DPAPI 以外的本机凭据提供者留待独立排期。
 
 ## 暂不做
 
