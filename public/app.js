@@ -141,6 +141,10 @@ function renderTabs() {
   }
 }
 function activate(id) { activeId = id; renderTabs(); renderActive(); setTimeout(() => fitActive(), 20); terminals.get(id)?.term.focus(); }
+function canReturnToAgent(s) {
+  return ready && s.status === 'open' && !!s.handoff && !!s.assignedTo &&
+    (!s.lock || (s.lock.kind === 'user' && s.lock.owner === clientId));
+}
 function renderActive() {
   const s = sessions.get(activeId);
   $('empty').classList.toggle('hidden', !!s); $('session-panel').classList.toggle('hidden', !s);
@@ -154,10 +158,14 @@ function renderActive() {
   if (!ready) { banner = '界面连接已断开，SSH 会话由本地服务继续维护。正在重新连接…'; kind = 'private'; }
   else if (s.status === 'closed') banner = 'SSH 连接已关闭。可查看已有输出，或点击页签右侧 × 移除此页签；重新连接请使用左侧服务器列表。';
   else if (s.privateMode) { banner = `私密已开启 · Agent 无权观察或输入，屏幕仍保留。${s.lock && !mine ? '输入由另一方持有，请点击「接管输入权」后操作。' : '关闭私密后，当前画面和仍保留的历史将可被 Agent 看到。'}`; kind = 'private'; }
+  else if (s.handoff) {
+    banner = s.lock ? (mine ? '当前页面持有输入权。' : '另一页面持有输入权。') : '输入权空闲，可接管输入权或直接开始输入。';
+    kind = 'user';
+  }
   else if (s.lock?.kind === 'agent') { banner = `🔒 ${actorLabel(s.lock.agent)} 持有输入权 · 你可观察并随时接管。交接不终止当前程序。`; kind = 'agent'; }
   else if (s.lock) { banner = `🔒 ${mine ? '当前页面持有输入权' : s.lock.owner === 'pending-user' ? '等待用户接管输入权' : '另一页面持有输入权'} · 释放输入权后，其他页面或已关联 Agent 可获取。释放不终止当前程序。`; kind = 'user'; }
   else { banner += ' 输入权空闲，可接管输入权；开始输入也会自动获取锁。'; }
-  if (s.status === 'open') banner += ' 操作完成后请主动释放输入权。';
+  if (s.status === 'open' && !s.handoff) banner += ' 操作完成后请主动释放输入权。';
   $('status-banner').className = 'status-banner ' + kind; $('status-banner').textContent = banner;
   $('session-detail').textContent = `输入权：${s.lock ? mine ? '当前页面' : s.lock.kind === 'agent' ? actorLabel(s.lock.agent) : '另一页面' : '空闲'}  ·  ${s.id.slice(0, 8)}`;
   $('terminal-size').textContent = `${s.cols} × ${s.rows}`;
@@ -169,11 +177,32 @@ function renderActive() {
   $('private').disabled = !ready;
   $('clear-history').disabled = !ready;
   $('release').disabled = !ready || s.status !== 'open' || !mine || controlPending.has(s.id);
-  $('release').title = mine ? '释放当前页面的输入锁；保留运行程序与未发送输入' : '只有当前页面持有输入权时才能释放';
+  $('release').title = mine ? (s.handoff ? '释放输入权并结束人工交接' : '释放当前页面的输入锁；保留运行程序与未发送输入') : '只有当前页面持有输入权时才能释放';
   $('copy-session').disabled = !ready;
   $('view-history').disabled = !ready;
   $('return-to-user').disabled = !ready || s.status !== 'open' || !s.assignedTo;
+  renderHandoff(s, mine);
   renderMessages();
+}
+function renderHandoff(s, mine) {
+  const protectedForUser = s.status === 'open' && !!s.handoff;
+  $('handoff-panel').classList.toggle('hidden', !protectedForUser);
+  $('return-to-agent').classList.toggle('hidden', !protectedForUser);
+  $('return-to-agent').disabled = !canReturnToAgent(s) || controlPending.has(s.id);
+  const message = protectedForUser && !s.privateMode && s.assignedTo ? s.handoff.message : null;
+  const messageNode = $('handoff-message');
+  messageNode.textContent = message ? `Agent 请求交回：${message}` : '';
+  messageNode.classList.toggle('hidden', !message);
+  let hint = '';
+  if (protectedForUser) {
+    if (!ready) hint = '重新连接后可操作。';
+    else if (s.lock && !mine) hint = '当前由另一页面持有输入权，请在该页面交回。';
+    else if (!s.assignedTo) hint = mine ? '释放输入权可结束人工交接。' : '获取输入权后可释放，结束人工交接。';
+    else if (s.privateMode) hint = mine ? '可以交回或释放。私密保持开启。' : '交回后私密保持开启。';
+    else if (mine) hint = '处理完毕后，可交回 Agent 或释放输入权。';
+    else hint = '可直接处理，或交回 Agent。';
+  }
+  $('handoff-hint').textContent = hint;
 }
 function renderMessages() {
   const s = sessions.get(activeId);
@@ -519,19 +548,24 @@ $('delete-profile').addEventListener('click', async () => {
   if (!confirm('删除此服务器配置？已有 SSH 连接会继续保留。')) return;
   try { await api('/api/profiles/' + $('profile-form').elements.id.value, { method: 'DELETE' }); $('profile-dialog').close(); } catch (e) { toast(e.message); }
 });
-for (const [id, action] of [['takeover', 'takeover'], ['release', 'release'], ['close-session', 'close'], ['return-to-user', 'return-to-user']]) {
+for (const [id, action] of [['takeover', 'takeover'], ['release', 'release'], ['close-session', 'close'], ['return-to-user', 'return-to-user'], ['return-to-agent', 'return-to-agent']]) {
   $(id).addEventListener('click', async () => {
     let changingControl;
     try {
       const s = getActive();
+      if (action === 'return-to-agent' && !canReturnToAgent(s)) return;
       if (action === 'close' && !confirm('关闭此 SSH 连接？该会话中的 shell 将结束。')) return;
       // Drain local keystrokes before a control operation.
       const t = terminals.get(s.id); if (t.sending || t.input) throw new Error('输入正在发送，请稍后操作');
-      if (action === 'takeover' || action === 'release') {
+      if (action === 'takeover' || action === 'release' || action === 'return-to-agent') {
         if (controlPending.has(s.id)) throw new Error('输入权正在变更，请稍候');
         changingControl = s.id; controlPending.add(s.id); renderActive();
       }
-      await request(action, { sessionId: s.id }); if (action === 'takeover') fitActive(); t.term.focus();
+      const args = { sessionId: s.id };
+      if (action === 'return-to-agent') args.revision = s.revision;
+      await request(action, args);
+      if (action === 'takeover') fitActive();
+      if (activeId === s.id && terminals.has(s.id)) t.term.focus();
     } catch (e) { toast(e.message); }
     finally { if (changingControl) { controlPending.delete(changingControl); renderActive(); } }
   });

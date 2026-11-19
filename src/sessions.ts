@@ -15,6 +15,10 @@ export interface Pty {
   onExit(fn: (event: { exitCode: number }) => void): unknown;
 }
 type Lock = { kind: 'user' | 'agent'; owner: string; lease: string; agent?: AgentIdentity };
+export class HandedToUserError extends Error {
+  readonly code = 'handed_to_user';
+  constructor() { super('终端已交给用户处理，请等待用户点击「交回 Agent」或主动释放输入权。'); }
+}
 
 export class Session extends EventEmitter {
   readonly id = randomUUID();
@@ -26,6 +30,7 @@ export class Session extends EventEmitter {
   status: 'open' | 'closed' = 'open';
   privateMode = false;
   lock: Lock | null;
+  private handoff: { message: string | null } | null = null;
   revision = 0;
   cols = 100;
   rows = 30;
@@ -58,7 +63,7 @@ export class Session extends EventEmitter {
     });
     pty.onData(data => this.output(data));
     pty.onExit(({ exitCode }) => {
-      this.status = 'closed'; this.lock = null; this.changed(); this.emit('exit', exitCode);
+      this.status = 'closed'; this.lock = null; this.handoff = null; this.changed(); this.emit('exit', exitCode);
     });
   }
   summary(agentId?: string) {
@@ -66,6 +71,7 @@ export class Session extends EventEmitter {
     return { id: this.id, name: this.profile.name, host: this.profile.host, port: this.profile.port,
       loginUser: this.profile.username, status: this.status, privateMode: this.privateMode,
       lock: publicLock, createdBy: this.createdBy, assignedTo: this.assignedTo,
+      handoff: this.handoff && { message: agentId && (this.privateMode || this.assignedTo?.id !== agentId) ? null : this.handoff.message },
       ...(agentId ? { isMine: this.assignedTo?.id === agentId } : {}),
       revision: this.revision, cols: this.cols, rows: this.rows, createdAt: this.createdAt,
       sequence: this.sequence, historyEpoch: this.historyEpoch };
@@ -80,11 +86,17 @@ export class Session extends EventEmitter {
     this.ensurePublic();
     if (this.assignedTo?.id === actor.id) return;
     if (this.lock?.kind === 'agent') throw new Error('另一 Agent 正在操作；请用户先接管输入，再交接');
-    // An observer may attach while the user is typing or running top. Input
-    // stays locked to that user until the holder explicitly releases it.
-    this.assignedTo = { ...actor }; this.changed();
+    this.assignedTo = { ...actor };
+    if (this.handoff) this.handoff = { message: null };
+    this.changed();
   }
-  returnToUser(owner: string) { this.takeover(owner); this.assignedTo = null; this.changed(); }
+  returnToUser(owner: string) {
+    this.ensureOpen();
+    this.lock = { kind: 'user', owner, lease: randomUUID() };
+    this.assignedTo = null;
+    if (this.handoff) this.handoff = { message: null };
+    this.changed();
+  }
   private output(data: string) {
     const seq = ++this.sequence;
     this.renderQueue = this.renderQueue.then(() => new Promise<void>(resolve => {
@@ -114,7 +126,16 @@ export class Session extends EventEmitter {
   releaseUser(owner: string) {
     this.ensureOpen();
     if (!this.lock || this.lock.kind !== 'user' || this.lock.owner !== owner) throw new Error('当前页面未持有输入权，不能释放');
-    this.lock = null; this.changed();
+    this.lock = null; this.handoff = null; this.changed();
+  }
+  returnToAgent(owner: string, revision: number) {
+    this.ensureOpen();
+    if (revision !== this.revision) throw new Error('终端状态已变化，请重新交回');
+    if (!this.handoff || !this.assignedTo) throw new Error('当前会话没有可交回的关联 Agent');
+    if (this.lock && (this.lock.kind !== 'user' || this.lock.owner !== owner)) {
+      throw new Error('只有持有输入权的页面可交回 Agent');
+    }
+    this.lock = null; this.handoff = null; this.changed();
   }
   releaseAgent(lease: string, actor: AgentIdentity) {
     this.ensureOpen(); this.requireAssignee(actor);
@@ -123,11 +144,24 @@ export class Session extends EventEmitter {
   }
   acceptControl(actor: AgentIdentity) {
     this.ensureOpen(); this.ensurePublic(); this.requireAssignee(actor);
-    if (this.lock) throw new Error('输入权已被占用，请等待持有者释放；Agent 不能抢占输入权');
+    if (this.handoff) throw new HandedToUserError();
+    if (this.lock?.kind === 'agent') throw new Error('输入权已被 Agent 占用，请等待持有者释放');
     this.lock = { kind: 'agent', owner: actor.id, agent: { ...actor }, lease: randomUUID() };
     this.changed();
     return { sessionId: this.id, lease: this.lock.lease,
       instruction: '直接通过 send_input 操作当前终端。先观察画面区分 Shell、密码提示或运行中的程序；完成本次操作后主动 release_control，不会自动释放。' };
+  }
+  handoffToUser(lease: string, actor: AgentIdentity) {
+    this.ensureOpen(); this.ensurePublic(); this.requireAssignee(actor);
+    if (this.lock?.kind !== 'agent' || this.lock.owner !== actor.id || this.lock.lease !== lease) {
+      throw new Error('Agent 锁已失效或不属于当前 Agent，不能交给用户');
+    }
+    this.lock = null; this.handoff = { message: null }; this.changed();
+  }
+  requestControlReturn(actor: AgentIdentity, message: string) {
+    this.ensureOpen(); this.ensurePublic(); this.requireAssignee(actor);
+    if (!this.handoff) throw new Error('当前会话未处于人工交接状态');
+    this.handoff = { message }; this.changed();
   }
   agentInput(data: string, lease: string, actor: AgentIdentity) {
     this.ensureOpen(); this.ensurePublic(); this.requireAssignee(actor);

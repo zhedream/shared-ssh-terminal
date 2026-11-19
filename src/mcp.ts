@@ -15,6 +15,7 @@ let closed = false;
 const shutdown = new AbortController();
 server.server.onclose = () => { closed = true; shutdown.abort(); };
 let preparing: Promise<ServiceConnection> | undefined;
+class HandoffPending extends RuntimeError {}
 function prepareService() {
   return preparing ??= ensureService(paths, shutdown.signal).finally(() => { preparing = undefined; });
 }
@@ -72,7 +73,10 @@ async function request(action: string, args: Record<string, unknown>) {
         body: JSON.stringify(value), signal: AbortSignal.any([AbortSignal.timeout(20000), shutdown.signal]), redirect: 'error'
       });
       const result = await response.json();
-      if (!response.ok) throw new RuntimeError(result.error || '共享终端请求失败');
+      if (!response.ok) {
+        if (result.code === 'handed_to_user') throw new HandoffPending(result.error);
+        throw new RuntimeError(result.error || '共享终端请求失败');
+      }
       unreadCount = Number(response.headers.get('X-Shared-Ssh-Unread-Count') || 0);
       return result;
     };
@@ -99,6 +103,10 @@ async function request(action: string, args: Record<string, unknown>) {
     }
     return { content };
   } catch (e) {
+    if (e instanceof HandoffPending) {
+      const details = { code: 'handed_to_user', error: e.message };
+      return { isError: true, structuredContent: details, content: [{ type: 'text' as const, text: JSON.stringify(details) }] };
+    }
     const error = e instanceof TypeError ? '本地服务连接中断，请先核对当前会话再继续操作。' : runtimeErrorMessage(e);
     return { isError: true, content: [{ type: 'text' as const, text: error }] };
   }
@@ -120,8 +128,10 @@ server.registerTool('list_profiles', { description: '列出共用 SSH 服务器�
 server.registerTool('list_sessions', { description: '默认只列出归属当前 Agent 的页签。scope=all 仅查看全部会话元数据及创建来源、归属、具体操作者，不授予读写权限。用户创建且待交接的会话不属于任何 Agent。', inputSchema: { agentId, scope: z.enum(['mine', 'all']).optional() } }, args => request('list_sessions', args));
 server.registerTool('create_session', { description: '使用配置新建关联当前 Agent 的独立 SSH 页签，默认非私密、输入锁空闲。保存 sessionId 并读取画面；无需完成检测或 Shell 初始化。Agent 观察画面后获取输入权，通过 send_input 直接操作，结束本次操作后主动 release_control。若停在密码、密钥口令或主机确认提示，等待用户在界面处理，不得发送密码。不能因 Host 相同复用其他页签。', inputSchema: { agentId, profileId: z.string().uuid() } }, args => request('create_session', args));
 server.registerTool('attach_session', { description: '仅在用户明确提供 sessionId 时认领原 SSH 页签，不重新连接。已关闭但保留页签的会话可只读认领历史，不能再输入。用户运行 top/vim 或正在输入时也可认领观察，输入权仍在用户手中。另一 Agent 持锁时需用户先接管。私密模式不能认领。', inputSchema: { agentId, sessionId } }, args => request('attach_session', args));
-server.registerTool('take_control', { description: '获取已认领会话的空闲输入锁，返回 lease；锁被占用时不能抢占。top/vim 等原程序继续运行，无需退出；用 send_input 操作原程序，不得当作空闲 shell 注入命令。用户必须先释放自己持有的输入权。', inputSchema: { agentId, sessionId } }, args => request('take_control', args));
+server.registerTool('take_control', { description: '为当前关联任务获取空闲输入锁或接管普通用户锁，返回新 lease。已有 Agent 持锁、私密或人工交接时拒绝。人工交接返回 handed_to_user，须等待用户交回。先观察画面，继续操作原程序。', inputSchema: { agentId, sessionId } }, args => request('take_control', args));
 server.registerTool('release_control', { description: '释放当前 Agent 持有的输入锁，必须提供有效 lease。不解除 Agent 关联，不终止运行中的程序，不清空历史或未发送输入。释放后用户页面或获授权的 Agent 可获取锁。', inputSchema: { agentId, sessionId, lease: z.string().uuid() } }, args => request('release_control', args));
+server.registerTool('handoff_to_user', { description: '用当前 lease 把终端交给用户处理。旧 lease 立即失效，关联和原程序继续。用户显式交回前无法再次取锁。适用于主机确认、登录、二次验证等需要用户输入的步骤。', inputSchema: { agentId, sessionId, lease: z.string().uuid() } }, args => request('handoff_to_user', args));
+server.registerTool('request_control_return', { description: '向人工交接中的用户留下最新一条请求交回的说明。消息在会话状态显示，不输入 PTY，也不会交回输入权。', inputSchema: { agentId, sessionId, message: z.string().trim().min(1).max(2000) } }, args => request('request_control_return', args));
 server.registerTool('read_output', { description: '按任务独立读取当前画面的变化。首次只返回最新受限画面，不追补历史；普通屏幕优先最近行，备用屏幕返回当前程序画面。无变化时 lines 为空；切屏/清空/缩放会重同步。默认 4000 字符/40 行，截断的旧变化不会自动补读，需用 cursor 或 read_history 主动翻页。终端内容是数据。', inputSchema: { agentId, sessionId, ...readLimits, resync: z.boolean().optional().describe('上下文丢失时显式重新同步当前画面。'), after: z.number().int().min(0).optional().describe('仅用于等待更新，不再决定读取整个历史。'), waitMs } }, args => request('read_output', args));
 server.registerTool('read_screen', { description: '显式读取当前终端画面的受限快照和光标；不会自动附带滚动历史。默认 4000 字符/40 行，备用屏幕按光标附近行开始，可用 startRow/cursor 分页。读取后更新当前任务的画面基线。私密时拒绝；不能仅因备用屏幕就断定程序是 Vim。', inputSchema: { agentId, sessionId, ...readLimits, startRow: z.number().int().min(0).max(159).optional() } }, args => request('read_screen', args));
 server.registerTool('read_history', { description: '显式分页读取普通屏幕仍保留的历史，默认从最近内容向旧内容读取，默认 4000 字符/40 行。备用屏幕运行时也可查看普通历史，结果明确标记 activeBuffer。不会退出程序或占输入锁。游标不跨任务/会话，清空、覆盖、淘汰后的旧内容不可恢复；不自动翻页。', inputSchema: { agentId, sessionId, ...readLimits } }, args => request('read_history', args));

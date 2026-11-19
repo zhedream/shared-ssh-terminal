@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { Session, type Pty } from '../src/sessions.js';
+import { HandedToUserError, Session, type Pty } from '../src/sessions.js';
 import { sshArgs, profileSchema, type Profile } from '../src/profiles.js';
 import type { AgentIdentity } from '../src/agents.js';
 
@@ -101,7 +101,81 @@ test('user partial input is observed from the same terminal while another page c
   s.userInput('browser', 'pending', s.revision); pty.emit('data', 'pending');
   assert((await s.screen()).text.startsWith('pending'));
   assert.throws(() => s.userInput('second-page', 'x', s.revision), /另一方/);
-  assert.throws(() => s.acceptControl(agentA), /占用/); s.close();
+  const revision = s.revision;
+  const next = s.acceptControl(agentA);
+  assert.throws(() => s.userInput('browser', 'old page', revision), /状态已变化/);
+  assert.throws(() => s.userInput('browser', 'current page', s.revision), /另一方/);
+  assert.deepEqual(pty.writes, ['pending']);
+  s.releaseAgent(next.lease, agentA); s.close();
+});
+
+test('manual handoff protects an idle or user-owned terminal until explicit return', () => {
+  const { s, pty } = fixture(agentA);
+  const first = s.acceptControl(agentA);
+  assert.throws(() => s.requestControlReturn(agentA, 'no handoff'), /未处于/);
+  assert.throws(() => s.handoffToUser(first.lease, agentB), /未交接/);
+  assert.throws(() => s.handoffToUser('wrong', agentA), /已失效/);
+  s.handoffToUser(first.lease, agentA);
+  assert.equal(s.lock, null);
+  assert.throws(() => s.handoffToUser(first.lease, agentA), /失效/);
+  assert.throws(() => s.agentInput('stale', first.lease, agentA), /失效/);
+  assert.throws(() => s.acceptControl(agentA), HandedToUserError);
+  s.requestControlReturn(agentA, 'first');
+  s.requestControlReturn(agentA, 'latest');
+  assert.deepEqual(s.summary().handoff, { message: 'latest' });
+  assert.deepEqual(s.summary(agentB.id).handoff, { message: null });
+  assert.deepEqual(pty.writes, []);
+  const oldRevision = s.revision;
+  s.userInput('browser', 'manual', oldRevision);
+  assert.throws(() => s.returnToAgent('browser', oldRevision), /状态已变化/);
+  assert.throws(() => s.returnToAgent('other-page', s.revision), /持有输入权/);
+  assert.throws(() => s.releaseUser('other-page'), /未持有/);
+  s.takeover('browser');
+  assert.throws(() => s.acceptControl(agentA), HandedToUserError);
+  s.returnToAgent('browser', s.revision);
+  assert.equal(s.summary().handoff, null);
+  assert.equal(s.lock, null);
+  assert.throws(() => s.returnToAgent('browser', s.revision), /没有可交回/);
+  const second = s.acceptControl(agentA);
+  assert.notEqual(second.lease, first.lease);
+  assert.equal(s.status, 'open');
+});
+
+test('handoff survives privacy and association changes and clears on release or exit', () => {
+  const { s } = fixture(agentA);
+  s.handoffToUser(s.acceptControl(agentA).lease, agentA);
+  s.requestControlReturn(agentA, 'for A');
+  s.attach(agentA);
+  assert.deepEqual(s.summary().handoff, { message: 'for A' });
+  s.setPrivacy(true);
+  assert.throws(() => s.acceptControl(agentA), /私密/);
+  assert.throws(() => s.requestControlReturn(agentA, 'hidden'), /私密/);
+  assert.deepEqual(s.summary(agentA.id).handoff, { message: null });
+  s.returnToAgent('browser', s.revision);
+  assert.throws(() => s.acceptControl(agentA), /私密/);
+  s.setPrivacy(false);
+  s.handoffToUser(s.acceptControl(agentA).lease, agentA);
+  s.requestControlReturn(agentA, 'for A');
+  s.attach(agentB);
+  assert.deepEqual(s.summary().handoff, { message: null });
+  assert.throws(() => s.acceptControl(agentB), HandedToUserError);
+  assert.throws(() => s.requestControlReturn(agentA, 'wrong'), /未交接/);
+  s.requestControlReturn(agentB, 'for B');
+  s.returnToUser('browser');
+  assert.deepEqual(s.summary().handoff, { message: null });
+  assert.throws(() => s.returnToAgent('browser', s.revision), /没有可交回/);
+  s.setPrivacy(true);
+  s.releaseUser('browser');
+  assert.equal(s.summary().handoff, null);
+  assert.equal(s.privateMode, true);
+  s.setPrivacy(false);
+  s.attach(agentB);
+  s.handoffToUser(s.acceptControl(agentB).lease, agentB);
+  s.userInput('browser', 'continue', s.revision);
+  s.close();
+  assert.equal(s.summary().handoff, null);
+  assert.equal(s.lock, null);
+  assert.throws(() => s.requestControlReturn(agentB, 'closed'), /已关闭/);
 });
 
 test('retained view tracks overwrites and never exposes a hidden raw output log', async () => {

@@ -27,3 +27,18 @@
 .pair-form code { color: var(--accent); overflow-wrap: anywhere; }
 #pair-status:empty { display: none; }
 .pair-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.handoff-panel {
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--border);
+  background: #172333;
+  color: #c4d1e0;
+  overflow-wrap: anywhere;
+}
+.handoff-panel strong { color: #edf4fa; margin-right: 8px; }
+.handoff-message {
+  margin: 6px 0 0;
+  max-height: 5em;
+  overflow: auto;
+  white-space: pre-wrap;
+}

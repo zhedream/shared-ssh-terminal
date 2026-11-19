@@ -9,7 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import * as pty from 'node-pty';
 import { z } from 'zod';
 import { Profiles, sshArgs } from './profiles.js';
-import { Session } from './sessions.js';
+import { HandedToUserError, Session } from './sessions.js';
 import { readSshConfig } from './ssh-config.js';
 import { Agents, type AgentIdentity } from './agents.js';
 import { ensureAskpass, SavedPasswordPty } from './saved-password.js';
@@ -152,6 +152,8 @@ const agentRequest = z.discriminatedUnion('action', [
   z.object({ action: z.literal('attach_session'), sessionId: z.string().uuid() }),
   z.object({ action: z.literal('take_control'), sessionId: z.string().uuid() }),
   z.object({ action: z.literal('release_control'), sessionId: z.string().uuid(), lease: z.string().uuid() }),
+  z.object({ action: z.literal('handoff_to_user'), sessionId: z.string().uuid(), lease: z.string().uuid() }),
+  z.object({ action: z.literal('request_control_return'), sessionId: z.string().uuid(), message: z.string().trim().min(1).max(2000) }),
   z.object({ action: z.literal('read_output'), sessionId: z.string().uuid(), ...readLimits, resync: z.boolean().optional(), after: z.number().int().min(0).optional(), waitMs: z.number().int().min(0).max(15000).default(0) }),
   z.object({ action: z.literal('read_screen'), sessionId: z.string().uuid(), ...readLimits, startRow: z.number().int().min(0).max(159).optional() }),
   z.object({ action: z.literal('read_history'), sessionId: z.string().uuid(), ...readLimits }),
@@ -196,6 +198,8 @@ async function agent(value: unknown, actor: AgentIdentity) {
   }
   if (p.action === 'take_control') return s.acceptControl(actor);
   if (p.action === 'release_control') { s.releaseAgent(p.lease, actor); return s.summary(actor.id); }
+  if (p.action === 'handoff_to_user') { s.handoffToUser(p.lease, actor); return s.summary(actor.id); }
+  if (p.action === 'request_control_return') { s.requestControlReturn(actor, p.message); return s.summary(actor.id); }
   if (p.action === 'read_screen' || p.action === 'read_history' || p.action === 'read_output') {
     if (s.privateMode) throw new Error('私密模式已开启，Agent 无权观察或输入');
     const owner = 'agent:' + actor.id;
@@ -305,7 +309,11 @@ async function handleBrowser(req: IncomingMessage, res: ServerResponse, secure: 
     res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-store' });
     const content = await readFile(file);
     res.end(route === '/' ? content.toString('utf8').replaceAll('__SST_UI_VERSION__', uiVersion) : content);
-  } catch (e: any) { if (!res.headersSent) json(res, 400, { error: e.message ?? '操作失败' }); else res.end(); }
+  } catch (e: any) {
+    if (res.headersSent) res.end();
+    else if (e instanceof HandedToUserError) json(res, 409, { error: e.message, code: e.code });
+    else json(res, 400, { error: e.message ?? '操作失败' });
+  }
 }
 
 const server = http.createServer((req, res) => void handleBrowser(req, res, false));
@@ -346,6 +354,7 @@ function attachBrowser(ws: WebSocket, expiry: number) {
           else if (p.type === 'terminal-reply') s.terminalReply(z.string().max(256).parse(p.data));
           else if (p.type === 'takeover') s.takeover(clientId);
           else if (p.type === 'return-to-user') s.returnToUser(clientId);
+          else if (p.type === 'return-to-agent') s.returnToAgent(clientId, z.number().int().parse(p.revision));
           else if (p.type === 'private') s.setPrivate(clientId);
           else if (p.type === 'privacy') s.setPrivacy(z.boolean().parse(p.privateMode));
           else if (p.type === 'release') s.releaseUser(clientId);

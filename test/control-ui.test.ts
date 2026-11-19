@@ -5,7 +5,7 @@ import { runInNewContext } from 'node:vm';
 
 test('both input controls update across ownership, release, privacy, pending and disconnected states', () => {
   const source = readFileSync(new URL('../public/app.js', import.meta.url), 'utf8');
-  const render = source.slice(source.indexOf('function renderActive()'), source.indexOf('function ensureTerminal('));
+  const render = source.slice(source.indexOf('function canReturnToAgent('), source.indexOf('function ensureTerminal('));
   const nodes = new Map<string, any>();
   const $ = (id: string) => {
     if (!nodes.has(id)) nodes.set(id, { classList: { toggle() {} }, value: '', setAttribute() {}, replaceChildren() {}, append() {} });
@@ -283,4 +283,89 @@ test('Cookie startup restores a session, reconnects after a network error, and h
   assert.equal(page.node('tabs').children.length, 0);
   assert.equal(page.sockets.length, 2);
   assert.ok(page.requests.every(r => r.route === '/api/auth'));
+});
+
+async function handoffFixture(snapshot = {}) {
+  const page = mockBrowser('http://localhost:43219/');
+  const session = {
+    id: 'fixture-handoff', status: 'open', cols: 100, rows: 30, revision: 11,
+    assignedTo: { id: 'agent-a', name: 'Agent A' }, lock: null, handoff: null, ...snapshot,
+  };
+  page.replies.push(204);
+  page.start();
+  await page.settle();
+  const ws = page.sockets[0];
+  ws.open();
+  ws.receive({ type: 'hello', clientId: 'page-a', profiles: [], sessions: [session] });
+  ws.receive({ type: 'synced', sessions: [session] });
+  return { page, ws, session };
+}
+
+test('handoff restores from the initial snapshot, follows broadcasts and gives privacy priority', async () => {
+  const { page, ws, session } = await handoffFixture({ handoff: { message: '<b>请交回</b>' } });
+  const hidden = (id: string) => page.node(id).classList.contains('hidden');
+  const update = (patch: object) => ws.receive({ type: 'state', session: { ...session, ...patch } });
+  assert.equal(hidden('handoff-panel'), false);
+  assert.equal(page.node('handoff-message').textContent, 'Agent 请求交回：<b>请交回</b>');
+  assert.equal(page.node('handoff-message').children.length, 0);
+  assert.equal(page.node('return-to-agent').disabled, false);
+  assert.equal(page.node('release').disabled, true);
+  update({ privateMode: true, lock: { kind: 'user', owner: 'page-a' } });
+  assert.match(page.node('status-banner').textContent, /^私密已开启/);
+  assert.equal(hidden('handoff-panel'), false);
+  assert.equal(hidden('handoff-message'), true);
+  assert.equal(page.node('return-to-agent').disabled, false);
+  assert.equal(page.node('release').disabled, false);
+  update({ assignedTo: null, lock: { kind: 'user', owner: 'page-a' }, handoff: { message: null } });
+  assert.equal(hidden('handoff-panel'), false);
+  assert.equal(page.node('handoff-message').textContent, '');
+  assert.equal(page.node('return-to-agent').disabled, true);
+  assert.equal(page.node('release').disabled, false);
+  update({ status: 'closed', handoff: null });
+  assert.equal(hidden('handoff-panel'), true);
+  assert.equal(hidden('return-to-agent'), true);
+});
+
+test('explicit return sends the current revision only from an eligible page and waits for server state', async () => {
+  const { page, ws, session } = await handoffFixture({ lock: { kind: 'user', owner: 'page-a' } });
+  const update = (patch: object) => ws.receive({ type: 'state', session: { ...session, ...patch } });
+  const hidden = () => page.node('handoff-panel').classList.contains('hidden');
+  const handoff = { message: '准备好了' };
+  assert.equal(hidden(), true);
+  update({ revision: 14, lock: { kind: 'user', owner: 'page-b' }, handoff });
+  assert.equal(page.node('return-to-agent').disabled, true);
+  assert.equal(page.node('release').disabled, true);
+  page.node('return-to-agent').fire('click');
+  assert.deepEqual(ws.frames, []);
+  update({ revision: 15, lock: null, handoff });
+  page.node('return-to-agent').fire('click');
+  page.node('return-to-agent').fire('click');
+  assert.equal(ws.frames.length, 1);
+  const first = JSON.parse(ws.frames[0]);
+  assert.equal(first.type, 'return-to-agent');
+  assert.equal(first.sessionId, session.id);
+  assert.equal(first.revision, 15);
+  assert.equal(page.node('return-to-agent').disabled, true);
+  ws.receive({ type: 'error', requestId: first.requestId, error: '状态已变化' });
+  await page.settle();
+  assert.equal(hidden(), false);
+  assert.equal(page.node('return-to-agent').disabled, false);
+  assert.equal(page.node('toast').textContent, '状态已变化');
+  update({ revision: 16, lock: null, handoff });
+  page.node('return-to-agent').fire('click');
+  const retry = JSON.parse(ws.frames[1]);
+  assert.equal(retry.revision, 16);
+  update({ revision: 17, lock: null, handoff: null });
+  ws.receive({ type: 'ack', requestId: retry.requestId });
+  await page.settle();
+  assert.equal(hidden(), true);
+  update({ revision: 18, handoff });
+  page.node('release').fire('click');
+  const release = JSON.parse(ws.frames[2]);
+  assert.equal(release.type, 'release');
+  assert.equal(hidden(), false);
+  update({ revision: 19, lock: null, handoff: null });
+  ws.receive({ type: 'ack', requestId: release.requestId });
+  await page.settle();
+  assert.equal(hidden(), true);
 });
