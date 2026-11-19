@@ -88,12 +88,12 @@ async function startService(t: TestContext, preferredPort?: number, blockDiscove
 async function wsSynced(authority: string, cookie: string) {
   const ws = new WebSocket(`ws://${authority}/terminal`, { origin: `http://${authority}`, headers: { cookie }, handshakeTimeout: 3000 });
   try {
-    const synced = new Promise<string | undefined>((resolve, reject) => {
-      let instanceId: string | undefined;
+    const synced = new Promise<{ instanceId: string; capabilities: { savePassword: boolean } } | undefined>((resolve, reject) => {
+      let hello: { instanceId: string; capabilities: { savePassword: boolean } } | undefined;
       ws.on('message', raw => {
         const message = JSON.parse(raw.toString());
-        if (message.type === 'hello') instanceId = message.instanceId;
-        if (message.type === 'synced') resolve(instanceId);
+        if (message.type === 'hello') hello = { instanceId: message.instanceId, capabilities: message.capabilities };
+        if (message.type === 'synced') resolve(hello);
       });
       ws.once('error', reject);
       ws.once('close', code => reject(new Error(`WebSocket closed before sync: ${code}`)));
@@ -157,8 +157,9 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
     assert.equal(redeemed.status, 204);
     const cookie = redeemed.headers.get('set-cookie')!.split(';')[0];
     assert.equal(await status(`${origin}/api/state`, { cookie }), 200);
-    assert.equal(await wsSynced(authority, cookie), instanceId);
-    assert.equal(await wsSynced(authority, cookie), instanceId);
+    const expected = { instanceId, capabilities: { savePassword: process.platform === 'win32' } };
+    assert.deepEqual(await wsSynced(authority, cookie), expected);
+    assert.deepEqual(await wsSynced(authority, cookie), expected);
   }
   assert.equal(await status(`${url}/api/state`, { authorization }), 401);
   assert.equal(await status(`${url}/api/state`), 401);

@@ -2,7 +2,7 @@
 
 共用同一个真实 SSH 会话：共享画面、独占输入、随时交接。浏览器供用户操作，MCP 供 Agent 操作，双方读取同一份终端画面与最多 2000 行滚动历史。
 
-详细背景和规则见 [文档索引](docs/README.md)，开发请先读 [AGENTS.md](AGENTS.md)。当前面向 Windows 本机运行，尚未选择开源许可证。
+Windows 为当前已验证平台，Linux 本机回环实现等待原生验收。项目尚未选择开源许可证。[文档索引](docs/README.md) · [开发章程](AGENTS.md)
 
 ## 操作规则
 
@@ -37,6 +37,8 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 配置和运行状态默认放在 `~/.shared-terminal/`。升级时可用环境变量接续旧配置目录，具体步骤见[本机配置与旧目录](docs/development.md#本机配置与旧目录)。
 
 从本地包安装后使用 `shared-ssh-terminal server` 启动或复用服务，`shared-ssh-terminal status` 查看实际地址与端口，`shared-ssh-terminal mcp` 供 MCP 客户端启动 stdio 适配端。在源码目录构建后，可用 `node dist/cli.js` 加同样的子命令。`stop` 会停止当前运行目录的服务并关闭其所有 SSH 会话。
+
+Linux 回环候选使用 Node CLI 和原生 OpenSSH。用 `pair` 生成配对链接并手动打开，登录可在终端输入密码或选择本机私钥。已从 Windows 带来的保存密码配置应保留原件并另建 Linux 登录配置。[Linux 环境和复跑命令](docs/development.md#linux-回环候选)
 
 本机浏览器可用 `shared-ssh-terminal pair` 重新获取五分钟有效的一次性链接。要让同一可信局域网中的浏览器访问，配置 HTTPS 监听和证书后运行 `shared-ssh-terminal pair --lan`。各已配对浏览器共享同一服务的 SSH 会话。[局域网 HTTPS 配置](docs/development.md#局域网-https)
 

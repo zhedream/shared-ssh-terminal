@@ -28,6 +28,7 @@ try {
 function saveDismissedTabs() { try { localStorage.setItem(dismissedStorageKey, JSON.stringify([...dismissedTabs].slice(-1000).sort())); } catch {} }
 let profiles = [], activeId = null, socket, clientId, ready = false, reconnectTimer, toastTimer;
 let pairing = false, checkingAuth = false;
+let canSavePassword = true;
 let confirmedInstanceId;
 let confirmedOpenSessions = new Set();
 let addressAdviceTimer;
@@ -462,6 +463,8 @@ function openTerminalSocket(url) {
       }
       confirmedInstanceId = instanceId;
       confirmedOpenSessions = new Set(p.sessions.filter(s => s.status === 'open').map(s => s.id));
+      canSavePassword = hello.capabilities?.savePassword !== false;
+      updateAuth();
       pruneSessionViews(currentIds);
       dismissedTabs = new Set([...dismissedTabs].filter(id => currentIds.has(id)));
       saveDismissedTabs();
@@ -591,8 +594,12 @@ function updateAuth() {
   const form = $('profile-form'), key = form.elements.auth.value === 'key', password = form.elements.auth.value === 'password';
   $('key-field').classList.toggle('hidden', !key); form.elements.identityFile.required = key;
   $('password-field').classList.toggle('hidden', !password);
-  const saved = password && form.elements.savePassword.checked;
+  form.elements.savePassword.disabled = !canSavePassword;
+  if (!canSavePassword) form.elements.savePassword.checked = false;
+  $('save-password-unavailable').classList.toggle('hidden', !password || canSavePassword);
+  const saved = password && canSavePassword && form.elements.savePassword.checked;
   $('saved-password-field').classList.toggle('hidden', !saved);
+  form.elements.password.disabled = !saved;
   form.elements.password.required = saved && form.dataset.hasSavedPassword !== 'true';
   if (!saved) form.elements.password.value = '';
 }
@@ -604,7 +611,8 @@ $('profile-form').elements.savePassword.addEventListener('change', updateAuth);
 $('profile-dialog').addEventListener('close', () => { $('profile-form').elements.password.value = ''; });
 $('profile-form').addEventListener('submit', async event => {
   event.preventDefault(); const p = Object.fromEntries(new FormData(event.target)); p.port = Number(p.port); if (!p.id) delete p.id; if (p.auth !== 'key') delete p.identityFile;
-  p.savePassword = p.auth === 'password' && event.target.elements.savePassword.checked;
+  if (canSavePassword) p.savePassword = p.auth === 'password' && event.target.elements.savePassword.checked;
+  else delete p.savePassword;
   if (!p.savePassword || !p.password) delete p.password;
   try { await api('/api/profiles', { method: 'POST', body: JSON.stringify(p) }); $('profile-dialog').close(); } catch (e) { toast(e.message); }
 });

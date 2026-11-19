@@ -60,3 +60,10 @@
   color: #efd9ad;
 }
 .restart-notice button { margin-left: auto; }
+
+.auth-capability-note {
+  margin: -6px 0 14px;
+  color: #acbdd1;
+  font-size: 12px;
+  line-height: 1.6;
+}

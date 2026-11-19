@@ -75,8 +75,8 @@
 
 ## 8 跨平台（计划）
 
-- 终端层不绑定 ConPTY，SSH 不绑定 `ssh.exe`；启动、停止等脚本改为 Node CLI。
-- 先保证 Windows，再支持 macOS 和 Linux。
+- Windows 继续使用 ConPTY、`ssh.exe`、DPAPI/askpass 和旧入口。Linux 回环候选复用 Node CLI、Unix PTY 和原生 `ssh`，覆盖手动密码及私钥，等待云端原生运行验收。[Linux 复跑命令](development.md#linux-回环候选)
+- macOS、本机凭据提供者、Linux 默认浏览器及 LAN/HTTPS 留待独立排期。
 
 ## 暂不做
 

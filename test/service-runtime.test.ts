@@ -4,6 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import * as nodeModule from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -177,6 +178,26 @@ test('an incomplete discovery is replaced and a startup failure can be repaired 
   await writeFile(profiles, '[]');
   assert.equal(JSON.parse((await f.cli('server')).stdout).running, true);
   assert.equal(JSON.parse((await readFile(f.paths.connection, 'utf8'))).address, '127.0.0.1');
+});
+
+test('a PTY module load failure gives a safe startup diagnostic and leaves the instance stopped', {
+  timeout: 25000, skip: typeof nodeModule.registerHooks !== 'function',
+}, async t => {
+  const f = await fixture(t);
+  const preload = path.join(f.directory, 'unavailable-pty.cjs');
+  const marker = randomUUID();
+  await writeFile(preload, `require('node:module').registerHooks({ resolve(specifier, context, next) {
+    if (specifier === 'node-pty') throw new Error('${marker}');
+    return next(specifier, context);
+  } });`);
+  // The detached server inherits NODE_OPTIONS. Keep the hook inside this fixture.
+  const env = { ...f.env, NODE_OPTIONS: `--require ${JSON.stringify(preload)}` };
+  await assert.rejects(run(process.execPath, [...nodeArgs, 'server'], { cwd: installRoot, env, windowsHide: true, timeout: 16000 }),
+    error => Boolean((error as { stderr?: string }).stderr?.includes('本地服务启动失败')));
+  const log = await readFile(f.paths.stderr, 'utf8');
+  assert.match(log, /无法加载 node-pty 原生模块/);
+  assert(!log.includes(marker));
+  assert.equal(JSON.parse((await f.cli('status')).stdout).running, false);
 });
 
 test('stop rejects records copied from a different runtime and conservatively handles an unknown owner', { timeout: 35000 }, async t => {

@@ -14,6 +14,25 @@ npm run test:e2e
 
 `start.cmd` 在首次缺少 CLI 构建产物时先构建，再启动或复用后台服务并打开默认浏览器。源码更新后可先运行 `npm run build`。`stop.cmd` 停止当前运行目录的服务，关闭该实例的所有 SSH。构建文件在 dist，安装依赖在 node_modules，均不提交。
 
+## Linux 回环候选
+
+在原生 Linux 用 Node.js 22 或 24、npm 和系统 OpenSSH 客户端验收。`node-pty` 在 Linux 需要本机构建工具。准备 Python 3、`make`、C/C++ 编译器和可用的 Node 头文件。测试还使用 `/bin/sh`、`stty`、`/dev/pts` 和 IPv4 回环。以下命令从干净候选源码目录运行，只使用各测试自建的临时配置和回环夹具。先确认测试 shell 无继承的 `SHARED_SSH_LAN_*` 设置。
+
+```sh
+uname -srmo
+node --version
+npm --version
+ssh -V
+npm ci
+node -e 'const assert = require("node:assert/strict"); assert.equal(process.platform, "linux"); assert.equal(typeof require("node-pty").spawn, "function")'
+npm run build
+node --import tsx --test test/local-network.test.ts test/service-runtime.test.ts test/profiles.test.ts test/pairing.test.ts
+node scripts/linux-e2e.mjs
+npm run check:docs
+```
+
+Linux 夹具从另一个目录用绝对 CLI 路径测试 `server`、`status`、`pair`、`stop` 和 `mcp`，并验证两路 WS、密码／私钥、PTY 缩放以及实例重启。日常在本机用 `pair` 输出的地址手动打开浏览器。首次确认主机指纹后，在终端输入密码或使用指定私钥。若已有 Windows 保存密码配置，使用原 Windows 账户，或在「服务器 → 添加服务器」另建手动配置。Linux 当前回环候选的原生实测组合待云端验收。
+
 ## 本机配置与旧目录
 
 默认配置和 known_hosts 位于 `~/.shared-terminal/data/`，实例发现文件、后台日志和 askpass 助手位于 `~/.shared-terminal/runtime/`。`SHARED_SSH_DATA_DIR` 和 `SHARED_SSH_RUNTIME_DIR` 可分别覆盖，相对路径按调用时的工作目录解析。`SHARED_SSH_PORT` 配置首选端口，默认 43127，占用时使用系统分配的端口。一个运行目录对应一个后台实例，配置也应由同一个实例负责写入。
@@ -121,7 +140,8 @@ if ($resolvedFixture.StartsWith($fixturePrefix, [StringComparison]::OrdinalIgnor
 | --- | --- |
 | npm run build | TypeScript 类型和输出 |
 | npm test | 本机与局域网端口、发现、配对、HTTP／WS 权限、并发 CLI／MCP 首连与重连、会话及按钮状态。局域网集成测试使用临时证书、OpenSSL 和具体私有 IPv4 接口 |
-| npm run test:e2e | 本机 OpenSSH/SSH2/ConPTY、密码/密钥/保存密码、真实 Vim、跨页面、多个 MCP 进程、独立消息与标准通知、同实例浏览器重连和服务重启后显式新建 SSH |
+| npm run test:e2e | Windows 本机 OpenSSH/SSH2/ConPTY、密码/密钥/保存密码、真实 Vim、跨页面、多个 MCP 进程、独立消息与标准通知、同实例浏览器重连和服务重启后显式新建 SSH |
+| node scripts/linux-e2e.mjs | 原生 Linux 候选的回环 CLI、配对、Unix PTY、手动密码/测试私钥、两路 WS/MCP、进程退出及重启 |
 | node scripts/shell-smoke.mjs | 本机 Bash 原始输入；设置 SST_TEST_ZSH 可加测 Zsh |
 | npm run check:docs | 所有文档索引和相对引用 |
 | npm run check:publish | Git 暂存版本中的私密目录、主机、本机路径和常见凭据 |

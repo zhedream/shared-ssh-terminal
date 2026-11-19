@@ -138,7 +138,10 @@ try {
   ws = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: browserHeaders });
   ws.on('message', raw => {
     const p = JSON.parse(raw.toString());
-    if (p.type === 'hello') { clientId = p.clientId; browserInstanceId = p.instanceId; }
+    if (p.type === 'hello') {
+      assert.equal(p.capabilities.savePassword, true);
+      clientId = p.clientId; browserInstanceId = p.instanceId;
+    }
     if (p.type === 'hello' || p.type === 'synced') for (const s of p.sessions) states.set(s.id, s);
     if (p.type === 'synced') ready = true;
     if (p.type === 'state') states.set(p.session.id, p.session);

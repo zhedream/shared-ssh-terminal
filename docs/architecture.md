@@ -4,14 +4,14 @@
 
 ```text
 Agent 应用 A ── stdio MCP ── 适配进程 A ─┐
-Agent 应用 B ── stdio MCP ── 适配进程 B ─┼── HTTP ── 本机单例服务 ── ConPTY + ssh.exe ── 远端 PTY
+Agent 应用 B ── stdio MCP ── 适配进程 B ─┼── HTTP ── 本机单例服务 ── 本机 PTY + OpenSSH ── 远端 PTY
 本机浏览器 ─────── HTTP + WebSocket ────┤
 局域网浏览器 ───── HTTPS + WSS ─────────┘     可选独立浏览器监听
 ```
 
 每个运行目录对应一个后台实例，实例持有所有 SSH 和状态。默认优先绑定 `127.0.0.1:43127`，占用时申请系统分配的 IPv4 回环端口。各 MCP 客户端启动自己的 stdio 适配进程，与 CLI 共用本机服务发现和就绪检查。路径默认从用户目录计算，可通过环境覆盖。[本机配置与旧目录](development.md#本机配置与旧目录)
 
-服务持有按实际运行目录区分的操作系统锁，进程退出时自动释放。Windows 使用命名管道。所有配置的监听就绪后，以同目录临时文件和原子重命名发布 `ui.json` 和 `connection.json`。后者的 `url`、`address`、`port` 指向回环，另含 `agentToken`、`pid`、`instanceId` 和可选的 `lan` 对象。`lan` 发布 HTTPS 绑定地址 `address`、实际 `port`、浏览器入口 `origin`。回环 `/agent/instance` 的认证探测核对服务类型、运行目录标识、PID、两路监听信息和实例 ID。旧版发现记录和探测同时缺少 `instanceId` 时可继续连接，实例代次未知。一侧缺失或 ID 不一致时拒绝该发现记录。
+服务持有按实际运行目录区分的操作系统锁，进程退出时自动释放。Windows 使用命名管道，Linux 使用抽象 Unix 套接字。所有配置的监听就绪后，以同目录临时文件和原子重命名发布 `ui.json` 和 `connection.json`。后者的 `url`、`address`、`port` 指向回环，另含 `agentToken`、`pid`、`instanceId` 和可选的 `lan` 对象。`lan` 发布 HTTPS 绑定地址 `address`、实际 `port`、浏览器入口 `origin`。回环 `/agent/instance` 的认证探测核对服务类型、运行目录标识、PID、两路监听信息和实例 ID。旧版发现记录和探测同时缺少 `instanceId` 时可继续连接，实例代次未知。一侧缺失或 ID 不一致时拒绝该发现记录。
 
 浏览器负责显示及人工输入，MCP 负责结构化工具调用。两种入口最终访问同一 Session；消息是独立的本机服务数据，不经过远端。
 
@@ -41,11 +41,13 @@ MCP 适配进程为每个项目或聊天 `register_agent`，产生独立任务 I
 
 ## SSH 配置与密码
 
-profiles 独立维护，SSH config 导入只复制允许字段，不执行 Match exec 或 ProxyCommand。系统 SSH 用 `-F NUL` 避免隐式叠加其他配置；known_hosts 放在本机 data 目录，首次指纹由用户确认。
+profiles 独立维护，SSH config 导入只复制允许字段，不执行 Match exec 或 ProxyCommand。Windows 使用 ConPTY、`ssh.exe` 和 `-F NUL`。Linux 回环候选使用 Unix PTY、从 `PATH` 的绝对目录选择可执行的 `ssh`，并传入 `-F /dev/null`。两平台用显式参数传递连接信息并由用户确认首次主机指纹。Linux 在实例 data 目录打开 `./known_hosts`，全局已知主机文件指向 `/dev/null`。
 
 手动密码和密钥口令沿用 OpenSSH 的交互。已保存的密码通过 Windows DPAPI CurrentUser 加密；服务只在认证时解密，经随机能力令牌保护的本机命名管道交给 askpass 小组件。密码不进入环境变量、进程参数、原始 PTY 输入或工具返回。
 
 askpass 仅对本次端点的标准密码提示自动提供一次保存值；主机确认和进一步提问仍交给用户，回答不回显。保存密码模式只请求标准 password 认证，不自动填写验证码。端点信息变化时必须重新保存密码，避免把凭据发给另一台服务器。
+
+认证后的 WS `hello.capabilities.savePassword` 为 Windows `true`、Linux `false`。Linux 在服务端拒绝提交保存密码及密码字段，登录由 OpenSSH 在 PTY 中提示。Linux 对已有 Windows 密文的连接或编辑返回操作提示，保留现有配置和密文。Windows 编辑既有配置时省略两个凭据字段，仍保留同一端点的已保存密码。
 
 ## 消息与通知
 
@@ -55,4 +57,4 @@ Messages 模块只存有界内存数据，每会话最多 100 条。发送固定
 
 ## 部署边界
 
-当前是以 Windows 主机为中心的协作应用。配对浏览器具备操作共享会话的权限，适合获准共同操作 SSH 的成员。仅在可信的局域网内开启额外浏览器监听。[私密资料与公开发布](security.md)
+配对浏览器具备操作共享会话的权限，适合获准共同操作 SSH 的成员。Windows 的额外 HTTPS 监听面向可信局域网。Linux 候选只绑定回环，设置 `SHARED_SSH_LAN_*` 时会提示如何启动回环实例。[私密资料与公开发布](security.md)

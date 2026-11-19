@@ -6,11 +6,11 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
-import * as pty from 'node-pty';
 import { z } from 'zod';
 import { Profiles, sshArgs } from './profiles.js';
 import { HandedToUserError, Session } from './sessions.js';
 import { readSshConfig } from './ssh-config.js';
+import { hostKeyOptions, resolveLinuxSsh, sshPlatform } from './ssh-platform.js';
 import { Agents, type AgentIdentity } from './agents.js';
 import { ensureAskpass, SavedPasswordPty } from './saved-password.js';
 import { Messages, messagePage } from './messages.js';
@@ -29,6 +29,8 @@ const instanceId = randomUUID();
 let serviceLock: Awaited<ReturnType<typeof acquireServiceLock>>;
 let instance: { service: string; runtime: string; pid: number; address: string; port: number; instanceId: string; lan?: LanDiscovery } | undefined;
 let lanServer: https.Server | undefined;
+let platform: ReturnType<typeof sshPlatform>;
+let pty: typeof import('node-pty');
 class ServiceBusy extends Error {}
 const token = () => randomBytes(32).toString('hex');
 const adminToken = token(), agentToken = token();
@@ -91,13 +93,11 @@ async function createSession(profileId: string, owner: string, creator?: AgentId
   let saved: SavedPasswordPty | undefined;
   try {
     const profile = profiles.get(profileId);
-    const args = sshArgs(profile);
-    // OpenSSH parses the value of -o as config text, even when argv is already
-    // separated. Quote the path so a directory name can contain spaces.
-    const knownHosts = path.join(DATA, 'known_hosts').split(path.sep).join('/').replaceAll('"', '\\"');
-    args.splice(args.length - 2, 0, '-o', `UserKnownHostsFile="${knownHosts}"`);
-    let askpassEnv = {};
-    let workingDirectory = ROOT;
+    const linux = platform.platform === 'linux';
+    const args = sshArgs(profile, platform.configFile, hostKeyOptions(platform.platform, DATA));
+    let cwd = linux ? DATA : ROOT;
+    const env: NodeJS.ProcessEnv = { ...process.env, TERM: 'xterm-256color' };
+    if (linux) env.SSH_ASKPASS_REQUIRE = 'never';
     if (profile.savePassword) {
       // Snapshot the credential before any await can let a profile edit change
       // the endpoint/credential pairing underneath this connection.
@@ -106,15 +106,20 @@ async function createSession(profileId: string, owner: string, creator?: AgentId
       saved = new SavedPasswordPty(profile, password);
       // Keep the helper path relative to the inherited working directory so its
       // argument stays ASCII. OpenSSH must not search PATH for a bare filename.
-      workingDirectory = path.dirname(helper);
-      askpassEnv = { ...await saved.listen(), SSH_ASKPASS: `.\\${path.basename(helper)}`, SSH_ASKPASS_REQUIRE: 'force' };
+      cwd = path.dirname(helper);
+      Object.assign(env, await saved.listen(), { SSH_ASKPASS: `.\\${path.basename(helper)}`, SSH_ASKPASS_REQUIRE: 'force' });
     }
+    const executable = linux ? await resolveLinuxSsh() : platform.executable;
     if (shuttingDown) throw new Error('服务正在停止');
     let child;
-    try { child = pty.spawn('ssh.exe', args, {
-      name: 'xterm-256color', cols: 100, rows: 30, cwd: workingDirectory,
-      env: { ...globalThis.process.env, TERM: 'xterm-256color', ...askpassEnv }
-    }); } catch (error) { saved?.dispose(); throw error; }
+    try { child = pty.spawn(executable, args, { name: 'xterm-256color', cols: 100, rows: 30, cwd, env }); }
+    catch (error) {
+      const { code, message } = error as NodeJS.ErrnoException;
+      if (code === 'ENOENT' || /^Cannot create process, error code: (2|3)$/.test(message)) {
+        throw new Error(`无法找到 OpenSSH 客户端 ${platform.executable}。请检查 OpenSSH 安装、PATH 和工作目录。`);
+      }
+      throw new Error('无法启动 OpenSSH 的本地 PTY。请检查系统终端权限和原生模块安装。');
+    }
     saved?.bind(child);
     const s = new Session(profile, saved ?? child, owner, creator);
     sessions.set(s.id, s);
@@ -125,7 +130,7 @@ async function createSession(profileId: string, owner: string, creator?: AgentId
     s.on('exit', exitCode => broadcast({ type: 'exit', sessionId: s.id, exitCode }));
     broadcast({ type: 'state', session: s.summary() });
     return s;
-    } catch (error) { saved?.dispose(); throw error; }
+  } catch (error) { saved?.dispose(); throw error; }
   finally { creating--; }
 }
 
@@ -388,7 +393,8 @@ async function syncBrowser(ws: WebSocket, clientId: string) {
   const pending: any[] = [];
   synchronizing.set(ws, pending);
   try {
-    send(ws, { type: 'hello', instanceId, uiVersion, clientId, profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
+    send(ws, { type: 'hello', instanceId, uiVersion, clientId, capabilities: { savePassword: platform.savePassword },
+      profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
     const boundaries = new Map<string, number>();
     for (const s of sessions.values()) {
       const snapshot = await s.snapshot();
@@ -407,11 +413,21 @@ async function syncBrowser(ws: WebSocket, clientId: string) {
 }
 
 async function main() {
+  platform = sshPlatform();
   const requestedPort = configuredPort();
   serviceLock = await acquireServiceLock(paths);
   if (!serviceLock) throw new ServiceBusy();
   let uiPublished = false;
   try {
+    if (platform.platform === 'linux' && Object.keys(process.env).some(key => key.startsWith('SHARED_SSH_LAN_'))) {
+      throw new RuntimeError('Linux 目前只支持本机回环。请取消 SHARED_SSH_LAN_* 配置后重新启动。');
+    }
+    try {
+      pty = await import('node-pty');
+      if (typeof pty.spawn !== 'function') throw new Error('Missing PTY factory');
+    } catch {
+      throw new RuntimeError('无法加载 node-pty 原生模块。请在当前系统及 Node 版本下重新安装依赖，并检查原生构建工具。');
+    }
     let lanConfiguration;
     try { lanConfiguration = await loadLanConfiguration(); }
     catch (error) { throw new RuntimeError((error as Error).message); }

@@ -73,20 +73,27 @@ function mockBrowser(address: string) {
     const classes = new Set(appHtml.match(new RegExp('id="' + id + '" class="([^"]+)"'))?.[1].split(' '));
     const listeners = new Map<string, Listener>();
     const children: unknown[] = [];
+    function field(value = '') {
+      return { value, checked: false, disabled: false, required: false, placeholder: '', addEventListener() {} };
+    }
+    const elements = {
+      auth: field('password'), savePassword: field('on'), password: field(), identityFile: field(),
+      id: field(), name: field(), host: field(), port: field('22'), username: field(), note: field(),
+    };
     return {
       children, textContent: '', value: '', inert: id === 'workspace', disabled: false,
-      elements: { auth: { addEventListener() {} }, savePassword: { addEventListener() {} } },
+      elements, dataset: {},
       classList: {
         add: (name: string) => classes.add(name),
         remove: (name: string) => classes.delete(name),
         contains: (name: string) => classes.has(name),
         toggle: (name: string, on: boolean) => on ? classes.add(name) : classes.delete(name),
       },
-      focus() {}, setAttribute() {}, remove() {},
+      focus() {}, setAttribute() {}, remove() {}, showModal() {}, close() {}, reset() {},
       append(...items: unknown[]) { children.push(...items); },
       replaceChildren() { children.length = 0; },
       addEventListener(type: string, listener: Listener) { listeners.set(type, listener); },
-      fire(type: string) { listeners.get(type)?.({ preventDefault() {} }); },
+      fire(type: string) { listeners.get(type)?.({ target: this, preventDefault() {} }); },
     };
   }
   const nodes = new Map<string, ReturnType<typeof mockElement>>();
@@ -136,6 +143,14 @@ function mockBrowser(address: string) {
     document: { getElementById: node, createElement: () => mockElement(), querySelector: () => null, querySelectorAll: () => [], addEventListener() {} },
     window: { addEventListener() {} }, location, history: { replaceState(_state: null, _title: string, path: string) { location.href = new URL(path, location).href; } },
     localStorage: storage, sessionStorage: storage, URL, URLSearchParams, AbortSignal, crypto,
+    FormData: class {
+      constructor(private form: ReturnType<typeof mockElement>) {}
+      *[Symbol.iterator]() {
+        for (const [key, field] of Object.entries(this.form.elements)) {
+          if (!field.disabled && (key !== 'savePassword' || field.checked)) yield [key, field.value];
+        }
+      }
+    },
     WebSocket: MockSocket, Terminal: MockTerminal, FitAddon: { FitAddon: class {} },
     setInterval() {},
     setTimeout(callback: () => void, ms: number) { timers.set(++timerId, { callback, ms }); return timerId; },
@@ -145,7 +160,7 @@ function mockBrowser(address: string) {
       const reply = replies.shift();
       assert.notEqual(reply, undefined, 'unexpected HTTP request ' + route);
       if (reply === 'offline') throw new Error('Offline');
-      return { status: reply, ok: reply === 204, async json() { return { error: 'unexpected server body' }; } };
+      return { status: reply, ok: reply !== undefined && reply >= 200 && reply < 300, async json() { return { error: 'unexpected server body' }; } };
     },
   };
   return {
@@ -456,4 +471,55 @@ test('address advice waits for persistent network errors and clears when auth re
   assert.equal(page.node('connection-advice').classList.contains('hidden'), true);
   assert.equal(page.node('pair-panel').classList.contains('hidden'), false);
   assert.equal(page.node('restart-notice').classList.contains('hidden'), true);
+});
+
+test('save-password capability controls the form and submission, defaulting to legacy support', async () => {
+  for (const capability of [false, true, undefined]) {
+    const page = mockBrowser('http://localhost:43219/');
+    page.replies.push(204, 200, 200);
+    page.start();
+    await page.settle();
+    const socket = page.sockets[0];
+    socket.open();
+    socket.receive({ type: 'hello', clientId: 'page', capabilities: capability === undefined ? undefined : { savePassword: capability }, profiles: [], sessions: [] });
+    const form = page.node('profile-form');
+    assert.equal(form.elements.savePassword.disabled, false);
+    socket.receive({ type: 'synced', sessions: [] });
+    page.invoke('openProfile()');
+    const supported = capability !== false;
+    assert.equal(form.elements.savePassword.disabled, !supported);
+    assert.equal(page.node('save-password-unavailable').classList.contains('hidden'), supported);
+    form.elements.savePassword.checked = true;
+    page.invoke('updateAuth()');
+    assert.equal(form.elements.savePassword.checked, supported);
+    assert.equal(form.elements.password.disabled, !supported);
+    assert.equal(form.elements.password.required, supported);
+    assert.equal(page.node('saved-password-field').classList.contains('hidden'), !supported);
+    // Inject stale field values so the submit guard is exercised independently of UI controls.
+    form.elements.savePassword.disabled = false;
+    form.elements.savePassword.checked = true;
+    form.elements.password.disabled = false;
+    form.elements.password.value = 'mock-password';
+    form.fire('submit');
+    await page.settle();
+    const passwordRequest = JSON.parse(String(page.requests[1].options.body));
+    assert.equal(Object.hasOwn(passwordRequest, 'savePassword'), supported);
+    assert.equal(Object.hasOwn(passwordRequest, 'password'), supported);
+    if (supported) {
+      assert.equal(passwordRequest.savePassword, true);
+      assert.equal(passwordRequest.password, 'mock-password');
+    }
+
+    form.elements.auth.value = 'key';
+    form.elements.identityFile.value = 'fixture-key';
+    page.invoke('updateAuth()');
+    assert.equal(page.node('save-password-unavailable').classList.contains('hidden'), true);
+    assert.equal(form.elements.password.value, '');
+    form.fire('submit');
+    await page.settle();
+    const keyRequest = JSON.parse(String(page.requests[2].options.body));
+    assert.equal(keyRequest.identityFile, 'fixture-key');
+    assert.equal(Object.hasOwn(keyRequest, 'password'), false);
+    assert.equal(keyRequest.savePassword, supported ? false : undefined);
+  }
 });
