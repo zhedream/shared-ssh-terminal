@@ -1,0 +1,26 @@
+# 共端使用说明
+
+## 浏览器配对
+
+- 在共端主机运行 `shared-ssh-terminal pair`，打开实际回环端口的一次性链接。链接五分钟内有效，兑换成功后地址片段会消失。裸地址入口是「共端首页 → 配对此浏览器 → 配对码 → 配对」。码无效、过期或已用时重新运行 `pair`，可点击「重新检查连接」确认现有登录态。 `127.0.0.1` 和 `localhost` 各需配对。
+- 在局域网使用 `shared-ssh-terminal status` 核对 `lan.origin`，再在共端主机运行 `shared-ssh-terminal pair --lan`。浏览器用可信证书访问签发时的 HTTPS 地址，回环和 LAN 浏览器可看同一会话。[包内 HTTPS 设置](../docs/development.md#局域网-https)
+
+## 认领和操作
+
+1. 用户在「共端首页 → 服务器 → 连接 ↗」打开会话，再通过会话工具栏的「复制 sessionId」把指定 ID 交给 Agent。Agent 用 `register_agent` 建立任务身份，后续传回它的 `agentId`，再用 `attach_session` 认领指定会话。
+2. 先用 `read_screen` 判断屏幕上的程序和提示，再调用 `take_control`。已关联 Agent 可取公开会话的空闲锁或普通用户锁。Agent 持有输入权时，用户可点击「接管输入权」，旧 lease 随之失效。
+3. 用 `send_input` 按当前程序的交互方式发送按键。用 `read_output` 看变化，需要时显式分页 `read_history`。原程序和 Shell 状态随输入权交接继续。等待时间没有命令完成含义。
+
+## 释放、人工交接与交回
+
+| 动作 | 行为 |
+| --- | --- |
+| 普通释放 | 持锁 Agent 调用 `release_control`，或持锁页面点击「释放输入权」。空闲后有权的一方可取锁，原程序继续。 |
+| Agent 显式交接 | 用有效 lease 调用 `handoff_to_user`。旧 lease 失效，当前页签显示「已交给用户」。用户处理指纹、登录、二次验证或其他人工步骤。打字、超时、刷新和掉线保留交接保护。 |
+| 用户明确交回 | 在该页签点击「交回 Agent」，或由当前持锁页面点击「释放输入权」。Agent 再调用 `take_control` 获得新 lease。另一页不能代当前持锁页面交回。 |
+
+Agent 取锁遇到 `handed_to_user` 时，可用 `list_sessions` 查询交接、在授权范围内读屏，并用 `request_control_return` 更新「Agent 请求交回」说明。用户可通过「发消息给 Agent」单独留言。Agent 读取实际收到的留言并用 `acknowledge_messages` 确认。 「解除关联」会撤销该 Agent 的访问。
+
+## 私密操作
+
+用户可用会话工具栏的「私密：关／开」切换权限。私密开启时，Agent 无法读取、认领、取锁或发送输入。显式交回保留私密。密码及确认提示由用户亲自处理。关闭私密前，如需移除仍保留的敏感画面或历史，可用「清空全部历史」。已读到的内容无法撤回。

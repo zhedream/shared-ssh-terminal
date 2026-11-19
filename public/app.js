@@ -588,7 +588,7 @@ $('clear-history').addEventListener('click', async () => {
   } catch (e) { toast(e.message); }
 });
 $('copy-session').addEventListener('click', async () => {
-  try { const s = getActive(); await navigator.clipboard.writeText(s.id); toast('已复制 sessionId；发给指定 Agent 认领观察。转交运行中的程序，请点击“释放输入权”。'); }
+  try { const s = getActive(); await navigator.clipboard.writeText(s.id); toast('已复制 sessionId，请发给指定 Agent 认领。普通持锁时，已关联 Agent 可在非私密状态取锁。人工交接由持锁 Agent 发起，用户可通过「交回 Agent」或在持锁时「释放输入权」结束交接。'); }
   catch { toast(`请手动复制 sessionId：${activeId}`); }
 });
 let resizeTimer; window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(fitActive, 100); });

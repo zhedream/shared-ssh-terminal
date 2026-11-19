@@ -7,7 +7,7 @@
   "bin": { "shared-ssh-terminal": "dist/cli.js" },
   "engines": { "node": ">=22" },
   "files": [
-    "dist/*.js", "public/", "scripts/ssh-askpass.cs", "docs/*.md", "AGENTS.md", "CLAUDE.md",
+    "dist/*.js", "skill/*.md", "public/", "scripts/ssh-askpass.cs", "docs/*.md", "AGENTS.md", "CLAUDE.md",
     "start.cmd", "stop.cmd", "Start-Terminal.ps1", "Stop-Terminal.ps1", "Register-MCP.ps1"
   ],
   "scripts": {
@@ -28,7 +28,9 @@
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/headless": "^5.5.0",
     "@xterm/xterm": "^5.5.0",
+    "jsonc-parser": "^3.3.1",
     "node-pty": "^1.1.0",
+    "smol-toml": "^1.9.1",
     "ws": "^8.19.0",
     "zod": "^3.25.0"
   },

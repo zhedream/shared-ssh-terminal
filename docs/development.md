@@ -27,6 +27,28 @@ $env:SHARED_SSH_DATA_DIR = Join-Path (Get-Location).Path 'data'
 
 MCP 客户端可运行 `shared-ssh-terminal mcp`，源码安装也可用 `node` 加 `dist/mcp.js` 的绝对路径。已有 `Register-MCP.ps1` 配置可沿用该入口。首次工具调用会查找或启动同目录的服务。`status` 输出 `running`、`address`、`port`，运行时另有 `pid`。若无法确认实例身份，命令报错并提示核对目录和服务日志。
 
+## 技能安装和卸载
+
+在安装本地包的机器上选择 `codex`、`claude`、`cursor` 或 `all`。源码构建后，在同样的参数前使用 `node <项目绝对路径>/dist/cli.js`。MCP 登记用 Node 和安装位置的绝对路径，换工作目录也可启动。旧版 `Register-MCP.ps1` 创建的同名条目由用户保管。如需迁移，请先备份并核对旧条目，再手动解除旧登记。
+
+```text
+shared-ssh-terminal install-skill --agent all
+shared-ssh-terminal skill
+shared-ssh-terminal uninstall-skill --agent all
+```
+
+| 客户端 | 用户级技能 | 默认 MCP 配置 |
+| --- | --- | --- |
+| Codex | `~/.agents/skills/shared-ssh-terminal/SKILL.md` | `~/.codex/config.toml` 的 `mcp_servers.shared_ssh_terminal`，支持 `CODEX_HOME` |
+| Claude Code | `~/.claude/skills/shared-ssh-terminal/SKILL.md` | `~/.claude.json` 顶层 `mcpServers.shared_ssh_terminal`，使用用户级 stdio |
+| Cursor | `~/.agents/skills/shared-ssh-terminal/SKILL.md` | `~/.cursor/mcp.json` 的 `mcpServers.shared_ssh_terminal` |
+
+Codex 和 Cursor 共用两者都可发现的薄技能。各客户端分别登记 MCP，最后一个使用者卸载时移除薄技能。安装前校验所有选中的配置，修改现有配置前在同目录保存 `.before-shared-ssh-*.bak`。安装结果列出备份路径。安装器保留无关配置、手改内容和同名的外部登记。遇到冲突请核对错误指出的目标文件，必要时用备份恢复。手动把本工具的 Codex 登记转换成其他 TOML 布局后，请按提示核对原区块。
+
+操作模拟验收时，把 `SHARED_SSH_INSTALL_HOME` 设为专用临时目录的绝对路径。此覆盖将所有客户端目标移入模拟目录，优先于客户端配置目录覆盖。用独立的 `SHARED_SSH_DATA_DIR` 和 `SHARED_SSH_RUNTIME_DIR` 启动包内 MCP 验证，再停止隔离实例。
+
+客户端格式依据为当前用户级技能及 stdio MCP 文档。[Codex 技能](https://developers.openai.com/codex/skills) · [Codex MCP](https://developers.openai.com/codex/mcp) · [Claude Code 技能](https://code.claude.com/docs/en/skills) · [Claude Code MCP](https://code.claude.com/docs/en/mcp) · [Cursor 技能](https://cursor.com/docs/skills) · [Cursor MCP](https://cursor.com/docs/mcp)
+
 ## 局域网 HTTPS
 
 默认只在 IPv4 回环提供本机入口。要在同一个后台实例上增加局域网浏览器入口，在启动者的环境中同时设置以下五项。证书和私钥的相对路径按启动调用时的工作目录解析。

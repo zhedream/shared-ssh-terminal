@@ -22,6 +22,7 @@
 
 - [安全与公开发布](security.md)：私密资料边界、Git 忽略和暂存区检查。
 - [开发、测试与运行](development.md)：命令、配置迁移、验证范围、调试、升级与限制。
+- [技能安装和卸载](development.md#技能安装和卸载)：Codex、Claude Code 和 Cursor 的用户级技能与 MCP 登记。
 - [局域网 HTTPS](development.md#局域网-https)：监听地址、证书、实际端口及浏览器配对。
 - [Windows 旧入口隔离验收](development.md#windows-旧入口隔离验收)：在专用 PowerShell 使用临时目录复跑启动、复用与停止。
 

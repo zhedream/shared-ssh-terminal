@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { servicePaths } from './paths.js';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+import { installRoot, servicePaths } from './paths.js';
 import { pairingUrl, ensureService, RuntimeError, runtimeErrorMessage, serviceStatus, stopService } from './service-runtime.js';
 
 function openBrowser(url: string) {
@@ -19,6 +21,23 @@ function openBrowser(url: string) {
 async function main(args: string[]) {
   const paths = servicePaths();
   const command = args[0];
+  if (args.length === 1 && command === 'skill') {
+    const { version } = JSON.parse(await readFile(path.join(installRoot, 'package.json'), 'utf8'));
+    const help = await readFile(path.join(installRoot, 'skill', 'usage.md'), 'utf8');
+    const guide = path.join(installRoot, 'docs', 'development.md').split(path.sep).join('/');
+    process.stdout.write(`shared-ssh-terminal ${version}\n\n${help.replace('../docs/development.md#局域网-https', `<${guide}#局域网-https>`)}`);
+    return;
+  }
+  if (command === 'install-skill' || command === 'uninstall-skill') {
+    const { agentNames, installSkill } = await import('./skill-install.js');
+    const selected = agentNames.find(agent => agent === args[2]);
+    if (args.length !== 3 || args[1] !== '--agent' || (!selected && args[2] !== 'all')) {
+      throw new RuntimeError(`用法: shared-ssh-terminal ${command} --agent codex|claude|cursor|all`);
+    }
+    const agents = selected ? [selected] : [...agentNames];
+    console.log(JSON.stringify(await installSkill(command === 'install-skill' ? 'install' : 'uninstall', agents)));
+    return;
+  }
   if (args.length === 1 && command === 'mcp') {
     await import('./mcp.js');
     return;
@@ -45,7 +64,7 @@ async function main(args: string[]) {
     console.log(JSON.stringify({ stopped }));
     return;
   }
-  const usage = '用法: shared-ssh-terminal server [--open] | status | pair [--lan] | mcp | stop';
+  const usage = '用法: shared-ssh-terminal server [--open] | status | pair [--lan] | mcp | stop | skill | install-skill --agent codex|claude|cursor|all | uninstall-skill --agent codex|claude|cursor|all';
   if (!args.length || (args.length === 1 && command === '--help')) { console.log(usage); return; }
   throw new RuntimeError(usage);
 }

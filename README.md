@@ -80,7 +80,9 @@ Agent 持锁时可以用 `handoff_to_user` 把运行中的终端交给用户。�
 
 ## MCP
 
-源码用 `Register-MCP.ps1` 注册全局 Codex MCP（先备份配置）。安装本地包后，MCP 客户端可配置 `shared-ssh-terminal mcp`。每个应用启动独立 stdio 适配进程，首次工具调用按同一运行目录查找服务，必要时启动后台实例。
+本地安装后运行 `shared-ssh-terminal install-skill --agent codex|claude|cursor|all`，为所选客户端安装使用说明入口并登记 MCP。`shared-ssh-terminal skill` 打印与已安装版本一致的操作说明。用 `uninstall-skill --agent …` 撤销本工具管理的登记。已有配置变更前会先备份。[技能安装和卸载](docs/development.md#技能安装和卸载)
+
+每个应用启动独立 stdio 适配进程，首次工具调用按同一运行目录查找服务，必要时启动后台实例。既有 `Register-MCP.ps1` 生成的 Codex 登记仍可使用。
 
 同一应用的不同项目或聊天先 `register_agent`，保存 id，后续每次调用传 `agentId`。默认 `list_sessions` 只列出自己的会话；`scope=all` 只列元数据，不授予访问权限。用户会话必须获得用户提供的 sessionId 才能认领。
 

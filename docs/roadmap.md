@@ -2,10 +2,10 @@
 
 本文件记录 v0.7 的规划及完成状态。标为计划的章节包含待交付项目。已实现的规则见 [产品理念](product.md)、[架构](architecture.md) 和 [开发章程](../AGENTS.md)。
 
-## 1 打包与分发（计划）
+## 1 打包与分发（本地打包已实现，发布待批准）
 
 - 发布 npm 包，使用方式为 `npx <包名> <子命令>`。
-- `package.json` 去掉 `private`，增加 `bin`；`files` 包含 `dist`、`public`、xterm 静态资源和 skill。
+- 本地包的 `bin` 和文件白名单已包含 CLI、浏览器资源和 skill。xterm 浏览器资源由运行时依赖提供。取消 `private` 与 npm 发布须另行批准。
 - 程序文件留在 npm 的安装位置，不再依赖项目目录。
 - 配置、会话数据、运行时文件和日志统一放在 `~/.shared-terminal/`（配置如 `config.json`）。现有环境变量 `SHARED_SSH_DATA_DIR`、`SHARED_SSH_RUNTIME_DIR`、`SHARED_SSH_PORT` 仍可覆盖。
 - 发布前必须验证 `node-pty` 的预编译包在目标平台可用。
@@ -21,10 +21,10 @@
 | `uninstall-skill` | 撤销安装，撤销前先备份 |
 | `skill` | 打印当前版本的使用说明 |
 
-## 2 主程序 + skill（计划）
+## 2 主程序 + skill（已实现）
 
 - skill 保持很薄，只让 Agent 运行 `<命令> skill` 读取说明；说明随主程序版本走，避免 skill 与程序版本不一致。参考 ego-lite 的做法：[skill 命令说明](https://github.com/citrolabs/ego-lite/blob/main/docs/ego-browser-skill-command.md)。
-- `install-skill --agent codex|claude|cursor|all`：写入对应 Agent 的 skill，并登记 MCP；取代只支持 Codex 的 `Register-MCP.ps1`。
+- `install-skill --agent codex|claude|cursor|all` 写入所选客户端的 skill 并登记 MCP。[技能安装和卸载](development.md#技能安装和卸载)
 - `uninstall-skill` 撤销 skill 和 MCP 登记，撤销前先备份原配置。
 - 安装与卸载都必须幂等，重复运行不产生重复登记。
 
