@@ -88,6 +88,27 @@ test('default directories share one home root and explicit overrides resolve fro
   assert.equal(overrides.runtime, path.resolve('custom-runtime'));
 });
 
+test('MCP advertises closed tool inputs while accepting calls with ignored fields', { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  const { client } = await connectMcp(t, f.env);
+  assert.equal(client.getServerVersion()?.name, 'shared-ssh-terminal');
+  const { tools } = await client.listTools();
+  assert(tools.length > 0);
+  for (const { inputSchema } of tools) assert.equal(inputSchema.additionalProperties, false);
+  const acknowledge = tools.find(tool => tool.name === 'acknowledge_messages');
+  assert.deepEqual(acknowledge?.inputSchema.required, ['sessionId', 'messageIds']);
+
+  const result = await client.callTool({ name: 'list_sessions', arguments: { extra: 'ignored' } });
+  assert.equal(result.isError, undefined);
+  assert(Array.isArray(result.content) && result.content[0]?.type === 'text');
+  assert.deepEqual(JSON.parse(result.content[0].text), []);
+
+  const invalid = await client.callTool({ name: 'list_sessions', arguments: { scope: 'invalid' } });
+  assert.equal(invalid.isError, true);
+  assert(Array.isArray(invalid.content) && invalid.content[0]?.type === 'text');
+  assert.match(invalid.content[0].text, /MCP error -32602:.*list_sessions.*scope/);
+});
+
 test('simultaneous CLI and MCP first calls converge, and the same adapters reconnect after stop', { timeout: 45000 }, async t => {
   const f = await fixture(t);
   const [a, b, c] = await Promise.all([connectMcp(t, f.env), connectMcp(t, f.env), connectMcp(t, f.env)]);

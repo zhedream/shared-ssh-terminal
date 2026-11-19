@@ -19,7 +19,7 @@ const name = 'shared-ssh-terminal';
 const serverName = 'shared_ssh_terminal';
 const marker = '# Managed by shared-ssh-terminal install-skill';
 const entrySchema = z.object({
-  config: z.string().min(1), entry: z.record(z.unknown()), configExisted: z.boolean(), namespaceExisted: z.boolean(),
+  config: z.string().min(1), entry: z.record(z.string(), z.unknown()), configExisted: z.boolean(), namespaceExisted: z.boolean(),
 }).strict();
 const installerSchema = z.object({
   version: z.literal(1), skillHash: z.string().regex(/^[a-f0-9]{64}$/),

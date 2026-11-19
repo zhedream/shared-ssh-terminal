@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { once } from 'node:events';
+import { on, once } from 'node:events';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { promisify } from 'node:util';
+import WebSocket from 'ws';
 import { Pairing } from '../src/pairing.js';
 import { installRoot, servicePaths } from '../src/paths.js';
 
@@ -107,6 +108,31 @@ test('CLI pairing, concurrent redemption, management isolation and cookie reuse 
   assert.equal((await check(origin, cookie)).status, 204);
   assert.equal((await check(origin, cookie.slice(0, -1) + (cookie.endsWith('0') ? '1' : '0'))).status, 401);
   assert.equal((await fetch(origin + '/api/profiles', { method: 'POST', headers: { cookie }, body: '{}' })).status, 403);
+  const invalidProfile = await fetch(origin + '/api/profiles', {
+    method: 'POST', headers: { cookie, Origin: origin, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'invalid-port', host: 'localhost', username: 'test', port: 0 }),
+  });
+  assert.equal(invalidProfile.status, 400);
+  const failure = await invalidProfile.json();
+  assert.equal(typeof failure.error, 'string');
+  assert(JSON.parse(failure.error).some((issue: { path: string[] }) => issue.path.join('.') === 'port'));
+
+  const browser = new WebSocket(origin.replace('http:', 'ws:') + '/terminal', { headers: { cookie, Origin: origin } });
+  try {
+    await once(browser, 'open', { signal: AbortSignal.timeout(4000) });
+    const requestId = 'invalid-profile-id';
+    const replies = on(browser, 'message', { signal: AbortSignal.timeout(4000) });
+    browser.send(JSON.stringify({ type: 'create', requestId, profileId: 'invalid' }));
+    for await (const [message] of replies) {
+      const reply = JSON.parse(String(message));
+      if (reply.requestId === requestId) {
+        assert.equal(reply.type, 'error');
+        assert.equal(typeof reply.error, 'string');
+        break;
+      }
+    }
+  } finally { browser.close(); }
+
   for (const route of ['/api/shutdown', '/api/pair-code', '/agent']) {
     assert.equal((await fetch(origin + route, { method: 'POST', headers: { cookie } })).status, 401);
   }

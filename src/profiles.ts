@@ -5,7 +5,7 @@ import path from 'node:path';
 import { WindowsSecrets, type SecretProtector } from './secrets.js';
 
 export const profileSchema = z.object({
-  id: z.string().uuid().optional(),
+  id: z.guid().optional(),
   name: z.string().trim().min(1).max(80),
   host: z.string().trim().min(1).max(253).regex(/^[a-zA-Z0-9_.:\-]+$/).refine(v => !v.startsWith('-')),
   port: z.number().int().min(1).max(65535).default(22),

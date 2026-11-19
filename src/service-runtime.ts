@@ -20,7 +20,7 @@ const bearerSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const connectionSchema = z.object({
   url: z.string(), agentToken: bearerSchema, pid: pidSchema,
   address: z.literal(LOCAL_ADDRESS), port: z.number().int().min(1024).max(65535),
-  instanceId: z.string().uuid().optional(),
+  instanceId: z.guid().optional(),
   lan: lanDiscoverySchema.optional(),
 }).refine(c => c.url === `http://${c.address}:${c.port}`);
 export type ServiceConnection = z.infer<typeof connectionSchema>;

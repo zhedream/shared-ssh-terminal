@@ -60,13 +60,30 @@ test('legacy profiles load without credentials; key authentication discards save
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test('Windows DPAPI encrypts and restores Unicode passwords without plaintext in protected output', { skip: process.platform !== 'win32' }, async () => {
+test('Windows DPAPI preserves legacy ciphertext when a profile edit omits credentials', { skip: process.platform !== 'win32' }, async () => {
   const protector = new WindowsSecrets();
   const password = '本机测试-"$`&秘密123';
   const cipher = await protector.protect(password);
   assert(!cipher.includes(password));
   assert.equal(await protector.unprotect(cipher), password);
   await assert.rejects(protector.unprotect('not-valid-data'), /无法加密或解密/);
+  const directory = await mkdtemp(path.join(tmpdir(), 'sst-profiles-'));
+  const file = path.join(directory, 'profiles.json');
+  const legacy = { id: '01234567-89ab-cdef-0123-456789abcdef', name: 'legacy', host: 'localhost', username: 'u' };
+  try {
+    await writeFile(file, JSON.stringify([{ profile: legacy, encryptedPassword: cipher }]));
+    const profiles = new Profiles(directory);
+    await profiles.load();
+    assert.deepEqual(profiles.get(legacy.id), { ...legacy, port: 22, auth: 'password', note: '', savePassword: true });
+    assert.equal(await profiles.password(legacy.id), password);
+    const edited = await profiles.save({ ...legacy, name: 'edited' });
+    assert.equal(edited.savePassword, true);
+    assert(!Object.hasOwn(edited, 'encryptedPassword'));
+    const persisted = await readFile(file, 'utf8');
+    assert(!persisted.includes(password));
+    assert.equal(JSON.parse(persisted)[0].encryptedPassword, cipher);
+    assert.equal(await profiles.password(legacy.id), password);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test('a platform without saved passwords rejects edits that omit credential fields and preserves existing ciphertext', async () => {

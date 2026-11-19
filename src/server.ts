@@ -154,18 +154,18 @@ const agentRequest = z.discriminatedUnion('action', [
   z.object({ action: z.literal('list_profiles') }),
   z.object({ action: z.literal('whoami') }),
   z.object({ action: z.literal('list_sessions'), scope: z.enum(['mine', 'all']).default('mine') }),
-  z.object({ action: z.literal('create_session'), profileId: z.string().uuid() }),
-  z.object({ action: z.literal('attach_session'), sessionId: z.string().uuid() }),
-  z.object({ action: z.literal('take_control'), sessionId: z.string().uuid() }),
-  z.object({ action: z.literal('release_control'), sessionId: z.string().uuid(), lease: z.string().uuid() }),
-  z.object({ action: z.literal('handoff_to_user'), sessionId: z.string().uuid(), lease: z.string().uuid() }),
-  z.object({ action: z.literal('request_control_return'), sessionId: z.string().uuid(), message: z.string().trim().min(1).max(2000) }),
-  z.object({ action: z.literal('read_output'), sessionId: z.string().uuid(), ...readLimits, resync: z.boolean().optional(), after: z.number().int().min(0).optional(), waitMs: z.number().int().min(0).max(15000).default(0) }),
-  z.object({ action: z.literal('read_screen'), sessionId: z.string().uuid(), ...readLimits, startRow: z.number().int().min(0).max(159).optional() }),
-  z.object({ action: z.literal('read_history'), sessionId: z.string().uuid(), ...readLimits }),
-  z.object({ action: z.literal('send_input'), sessionId: z.string().uuid(), lease: z.string().uuid(), data: z.string().max(16000) }),
-  z.object({ action: z.literal('read_messages'), sessionId: z.string().uuid(), unreadOnly: z.boolean().default(false), waitMs: z.number().int().min(0).max(15000).default(0), maxMessages: z.number().int().min(1).max(20).default(5), maxChars: z.number().int().min(2000).max(16000).default(4000), before: z.string().uuid().optional() }),
-  z.object({ action: z.literal('acknowledge_messages'), sessionId: z.string().uuid(), messageIds: z.array(z.string().uuid()).min(1).max(100) }),
+  z.object({ action: z.literal('create_session'), profileId: z.guid() }),
+  z.object({ action: z.literal('attach_session'), sessionId: z.guid() }),
+  z.object({ action: z.literal('take_control'), sessionId: z.guid() }),
+  z.object({ action: z.literal('release_control'), sessionId: z.guid(), lease: z.guid() }),
+  z.object({ action: z.literal('handoff_to_user'), sessionId: z.guid(), lease: z.guid() }),
+  z.object({ action: z.literal('request_control_return'), sessionId: z.guid(), message: z.string().trim().min(1).max(2000) }),
+  z.object({ action: z.literal('read_output'), sessionId: z.guid(), ...readLimits, resync: z.boolean().optional(), after: z.number().int().min(0).optional(), waitMs: z.number().int().min(0).max(15000).default(0) }),
+  z.object({ action: z.literal('read_screen'), sessionId: z.guid(), ...readLimits, startRow: z.number().int().min(0).max(159).optional() }),
+  z.object({ action: z.literal('read_history'), sessionId: z.guid(), ...readLimits }),
+  z.object({ action: z.literal('send_input'), sessionId: z.guid(), lease: z.guid(), data: z.string().max(16000) }),
+  z.object({ action: z.literal('read_messages'), sessionId: z.guid(), unreadOnly: z.boolean().default(false), waitMs: z.number().int().min(0).max(15000).default(0), maxMessages: z.number().int().min(1).max(20).default(5), maxChars: z.number().int().min(2000).max(16000).default(4000), before: z.guid().optional() }),
+  z.object({ action: z.literal('acknowledge_messages'), sessionId: z.guid(), messageIds: z.array(z.guid()).min(1).max(100) }),
   z.object({ action: z.literal('watch_messages'), after: z.number().int().min(0).default(0), waitMs: z.number().int().min(0).max(15000).default(0) }),
 ]);
 
@@ -305,7 +305,7 @@ async function handleBrowser(req: IncomingMessage, res: ServerResponse, secure: 
         broadcast({ type: 'profiles', profiles: profiles.list() }); return json(res, 200, profile);
       }
       if (route.startsWith('/api/profiles/') && req.method === 'DELETE') {
-        await profiles.remove(z.string().uuid().parse(route.split('/').at(-1)));
+        await profiles.remove(z.guid().parse(route.split('/').at(-1)));
         broadcast({ type: 'profiles', profiles: profiles.list() }); return json(res, 200, { ok: true });
       }
       return json(res, 404, { error: '接口不存在' });
@@ -347,15 +347,15 @@ function attachBrowser(ws: WebSocket, expiry: number) {
         if (ws.readyState !== WebSocket.OPEN || Date.now() >= expiry) return;
         if (typeof requestId !== 'string') throw new Error('请求缺少标识');
         let result: unknown = { ok: true };
-        if (p.type === 'create') result = (await createSession(z.string().uuid().parse(p.profileId), clientId)).summary();
+        if (p.type === 'create') result = (await createSession(z.guid().parse(p.profileId), clientId)).summary();
         else if (p.type === 'dismiss-tab') {
-          const id = z.string().uuid().parse(p.sessionId), s = sessions.get(id);
+          const id = z.guid().parse(p.sessionId), s = sessions.get(id);
           if (s?.status === 'open') throw new Error('请先关闭 SSH 连接，再移除页签');
           sessions.delete(id); messages.clear(id);
           broadcast({ type: 'dismissed', sessionId: id });
         }
         else {
-          const s = session(z.string().uuid().parse(p.sessionId));
+          const s = session(z.guid().parse(p.sessionId));
           if (p.type === 'input') s.userInput(clientId, z.string().max(16000).parse(p.data), z.number().int().parse(p.revision));
           else if (p.type === 'terminal-reply') s.terminalReply(z.string().max(256).parse(p.data));
           else if (p.type === 'takeover') s.takeover(clientId);
@@ -371,7 +371,7 @@ function attachBrowser(ws: WebSocket, expiry: number) {
           else if (p.type === 'send-message') {
             if (s.privateMode) throw new Error('请先关闭私密再向关联 Agent 发送消息');
             if (!s.assignedTo) throw new Error('当前会话尚未关联 Agent，请先提供 sessionId 让 Agent 认领');
-            if (z.string().uuid().parse(p.targetAgentId) !== s.assignedTo.id) throw new Error('关联 Agent 已变化，请确认接收者后重新发送');
+            if (z.guid().parse(p.targetAgentId) !== s.assignedTo.id) throw new Error('关联 Agent 已变化，请确认接收者后重新发送');
             result = messages.send(s.id, s.assignedTo, z.string().trim().min(1).max(2000).parse(p.text));
             broadcast({ type: 'messages', sessionId: s.id, messages: messages.list(s.id) });
           }

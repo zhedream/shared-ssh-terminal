@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 export const agentIdentitySchema = z.object({
-  id: z.string().uuid(),
+  id: z.guid(),
   name: z.string().trim().min(1).max(100),
   application: z.string().trim().min(1).max(100),
   project: z.string().max(2048).default(''),
