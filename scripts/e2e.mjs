@@ -6,6 +6,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import ssh2 from 'ssh2';
 import * as pty from 'node-pty';
 import { WebSocket } from 'ws';
@@ -18,6 +19,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tempPrefix = path.resolve(tmpdir(), 'sst-e2e-');
 const temporary = await mkdtemp(tempPrefix);
 const env = { ...process.env, SHARED_SSH_PORT: '43128', SHARED_SSH_DATA_DIR: path.join(temporary, 'profile data'), SHARED_SSH_RUNTIME_DIR: path.join(temporary, 'runtime files') };
+for (const key of Object.keys(env)) if (key.startsWith('SHARED_SSH_LAN_')) delete env[key];
+const execCliFile = promisify(execFile);
+const runCli = command => execCliFile(process.execPath, ['dist/cli.js', command], { cwd: root, env, windowsHide: true, timeout: 15000 });
 const key = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'pkcs1', format: 'pem' } });
 const identity = generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'pkcs1', format: 'pem' } });
 const identityFile = path.join(temporary, 'test-identity');
@@ -28,7 +32,9 @@ if (process.platform === 'win32') {
 }
 const parsedIdentity = ssh2.utils.parseKey(identity.privateKey);
 const children = new Set(), connections = new Set();
+let sshConnections = 0;
 const ssh = new ssh2.Server({ hostKeys: [key.privateKey] }, client => {
+  sshConnections++;
   connections.add(client); client.on('close', () => connections.delete(client)); client.on('error', () => {});
   client.on('authentication', ctx => {
     if (ctx.method === 'password' && ctx.username === 'test-user' && ctx.password === 'local-test-password') ctx.accept();
@@ -59,7 +65,7 @@ const ssh = new ssh2.Server({ hostKeys: [key.privateKey] }, client => {
 await new Promise(resolve => ssh.listen(0, '127.0.0.1', resolve));
 const sshPort = ssh.address().port;
 let service, ws, client, transport, clientB, transportB, browserTwo;
-let stderr = '', output = '', ready = false, ui, agent, clientId;
+let stderr = '', output = '', ready = false, ui, agent, clientId, browserInstanceId;
 const states = new Map(), pending = new Map(), perSessionOutput = new Map();
 const notifications = [], messageViews = new Map();
 async function until(predicate, label, timeout = 15000) {
@@ -132,7 +138,7 @@ try {
   ws = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: browserHeaders });
   ws.on('message', raw => {
     const p = JSON.parse(raw.toString());
-    if (p.type === 'hello') clientId = p.clientId;
+    if (p.type === 'hello') { clientId = p.clientId; browserInstanceId = p.instanceId; }
     if (p.type === 'hello' || p.type === 'synced') for (const s of p.sessions) states.set(s.id, s);
     if (p.type === 'synced') ready = true;
     if (p.type === 'state') states.set(p.session.id, p.session);
@@ -145,6 +151,7 @@ try {
     }
   });
   await until(() => ready, 'UI WebSocket ready');
+  assert.equal(browserInstanceId, agent.instanceId);
   transport = new StdioClientTransport({ command: process.execPath, args: [path.join(root, 'dist/mcp.js')], cwd: root, env });
   client = new Client({ name: 'shared-ssh-e2e', version: '1.0.0' }); await client.connect(transport);
   client.setNotificationHandler(LoggingMessageNotificationSchema, notice => { notifications.push(notice.params); });
@@ -344,6 +351,7 @@ try {
   ready = false; ws = new WebSocket(agent.url.replace('http:', 'ws:') + '/terminal', { headers: browserHeaders });
   ws.on('message', primaryHandler);
   await until(() => ready, 'browser reconnected');
+  assert.equal(browserInstanceId, agent.instanceId);
   // Transfer an already-running key-driven application from user to Agent.
   await input(id, 'printf "\\033[?1049hUSER-PROGRAM\\r\\n"; IFS= read -r -s -n 1 KEY; printf "\\033[?1049l\\nUSER-KEY:%s\\n" "$KEY"\r');
   await until(async () => (await call('read_screen', { sessionId: id })).buffer === 'alternate', 'user full-screen program');
@@ -422,7 +430,48 @@ try {
   await request('dismiss-tab', { sessionId: id }); await until(() => observerDismissed, 'dismiss pushed to another page');
   await request('dismiss-tab', { sessionId: id });
   assert(!(await call('list_sessions', { scope: 'all' })).some(s => s.id === id));
-  console.log('PASS: encrypted saved-password auto-login, fingerprint confirmation, failed-password manual retry with no credential exposure; no Shell integration or injected wrappers; password/key SSH, raw input, explicit locks, real Vim, cross-page replay identical to MCP, privacy and closed-history synchronization.');
+
+  // Keep a real SSH session, pending message and input lease across the stop boundary.
+  const beforeStop = await call('create_session', { profileId: keyProfile.id });
+  const oldArgs = { sessionId: beforeStop.id };
+  const oldLease = (await call('take_control', oldArgs)).lease;
+  await call('send_input', { ...oldArgs, lease: oldLease, data: 'for ((i=0;i<60;i++)); do printf "BEFORE-RESTART-%02d\\n" "$i"; done\r' });
+  await expectLine(client, beforeStop.id, 'BEFORE-RESTART-59');
+  const oldCursor = (await call('read_history', { ...oldArgs, maxLines: 2 })).nextCursor;
+  assert(oldCursor);
+  await request('send-message', { ...oldArgs, targetAgentId: primaryAgent.id, text: 'message from the old service' });
+  assert.equal((await call('read_messages', oldArgs)).messages.length, 1);
+  const oldInstance = agent.instanceId;
+  const beforeRestartConnections = sshConnections;
+  assert.equal(JSON.parse((await runCli('stop')).stdout).stopped, true);
+  await until(() => connections.size === 0, 'old SSH transports closed after stop');
+  assert.equal(JSON.parse((await runCli('server')).stdout).running, true);
+  agent = JSON.parse(await readFile(path.join(env.SHARED_SSH_RUNTIME_DIR, 'connection.json'), 'utf8'));
+  assert.notEqual(agent.instanceId, oldInstance);
+  const state = await fetch(agent.url + '/api/state', { headers: { Origin: agent.url, Cookie: cookie } });
+  assert.equal(state.status, 200);
+  assert.deepEqual((await state.json()).sessions, []);
+
+  const dropped = await call('create_session', { profileId: keyProfile.id }, true);
+  assert.equal(dropped.structuredContent.code, 'service_instance_changed');
+  assert.equal(dropped.structuredContent.instanceId, agent.instanceId);
+  assert.deepEqual(await call('list_sessions', { scope: 'all' }), []);
+  assert.equal((await call('whoami')).id, primaryAgent.id);
+  assert.match((await call('send_input', { ...oldArgs, lease: oldLease, data: 'no replay\r' }, true)).content[0].text, /会话不存在/);
+  assert.match((await call('read_messages', oldArgs, true)).content[0].text, /会话不存在/);
+  assert.equal(sshConnections, beforeRestartConnections);
+
+  const fresh = await call('create_session', { profileId: keyProfile.id });
+  assert.notEqual(fresh.id, beforeStop.id);
+  await expectLine(client, fresh.id, 'test-shell>');
+  assert.equal(sshConnections, beforeRestartConnections + 1);
+  assert(!(await readText(client, fresh.id)).includes('BEFORE-RESTART'));
+  assert.deepEqual((await call('read_messages', { sessionId: fresh.id })).messages, []);
+  const freshLease = (await call('take_control', { sessionId: fresh.id })).lease;
+  assert.notEqual(freshLease, oldLease);
+  assert.match((await call('send_input', { sessionId: fresh.id, lease: oldLease, data: 'no replay\r' }, true)).content[0].text, /锁已失效/);
+  assert.match((await call('read_history', { sessionId: fresh.id, cursor: oldCursor }, true)).content[0].text, /分页游标/);
+  console.log('PASS: password/key SSH, real Vim, explicit locks, privacy, messages, same-instance browser reconnect, and restart with a new SSH only after an explicit request.');
 
 } finally {
   for (const item of pending.values()) clearTimeout(item.timer);

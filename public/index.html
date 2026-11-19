@@ -15,7 +15,13 @@
   <header class="app-header">
     <div class="brand"><span class="brand-mark">›_</span><div><strong>共端</strong><span>SHARED SSH</span></div></div>
     <div class="header-description">共享画面，独占输入，随时交接。</div>
-    <div class="connection" role="status"><i id="connection-dot"></i><span id="connection-text">正在检查浏览器连接</span></div>
+    <div class="connection" role="status">
+      <i id="connection-dot"></i>
+      <div>
+        <span id="connection-text">正在检查浏览器连接</span>
+        <p id="connection-advice" class="connection-advice hidden">请在共端主机运行 <code>shared-ssh-terminal status</code> 查看当前地址。局域网浏览器请打开 <code>lan.origin</code>。</p>
+      </div>
+    </div>
   </header>
   <main id="pair-panel" class="pair-panel hidden" aria-labelledby="pair-title">
     <form id="pair-form" class="pair-form" method="post" autocomplete="off">
@@ -37,6 +43,10 @@
       <div class="sidebar-footer"><span class="local-dot"></span>仅在本机运行<div>认证信息由你在终端中输入</div></div>
     </aside>
     <main>
+      <div id="restart-notice" class="restart-notice hidden">
+        <span role="status">共端服务已重新启动，此前的 SSH 会话已结束。请在「服务器」列表点击「连接 ↗」建立新会话。</span>
+        <button type="button" id="dismiss-restart-notice">关闭提示</button>
+      </div>
       <nav id="tabs" class="tabs" role="tablist" aria-label="SSH 连接页签"></nav>
       <section id="empty" class="empty">
         <div class="empty-symbol">›_</div>

@@ -12,6 +12,7 @@ import { promisify } from 'node:util';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { installRoot, servicePaths } from '../src/paths.js';
+import { findService } from '../src/service-runtime.js';
 
 const run = promisify(execFile);
 const nodeArgs = ['--import', 'tsx', 'src/cli.ts'];
@@ -19,11 +20,12 @@ const nodeArgs = ['--import', 'tsx', 'src/cli.ts'];
 async function fixture(t: TestContext, stop = true) {
   const prefix = path.resolve(tmpdir(), 'sst-service-test-');
   const directory = await mkdtemp(prefix);
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     SHARED_SSH_DATA_DIR: path.join(directory, 'data'), SHARED_SSH_RUNTIME_DIR: path.join(directory, 'runtime'),
     SHARED_SSH_PORT: '43128',
   };
+  for (const key of Object.keys(env)) if (key.startsWith('SHARED_SSH_LAN_')) delete env[key];
   const paths = servicePaths(env);
   const cli = (command: string) => run(process.execPath, [...nodeArgs, command], {
     cwd: installRoot, env, windowsHide: true, timeout: 16000,
@@ -56,6 +58,16 @@ async function whoami(client: Client) {
   assert.equal(result.isError, undefined, 'MCP whoami must succeed');
   assert(Array.isArray(result.content) && result.content[0]?.type === 'text');
   return JSON.parse(result.content[0].text).id;
+}
+
+async function expectInstanceChange(client: Client, name = 'whoami', args = {}) {
+  const result = await client.callTool({ name, arguments: args }, undefined, { timeout: 15000 });
+  assert.equal(result.isError, true);
+  assert.equal(result.structuredContent?.code, 'service_instance_changed');
+  assert.match(String(result.structuredContent?.error), /list_sessions.*create_session/);
+  assert(Array.isArray(result.content) && result.content[0]?.type === 'text');
+  assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+  return result.structuredContent.instanceId;
 }
 
 test('default directories share one home root and explicit overrides resolve from the caller', () => {
@@ -92,10 +104,57 @@ test('simultaneous CLI and MCP first calls converge, and the same adapters recon
   assert.match(stopped.stderr, /关闭其所有 SSH 会话/);
   await delay(2300); // at least one background watcher retry interval
   assert.equal(JSON.parse((await f.cli('status')).stdout).running, false);
-  assert.equal(await whoami(a.client), started[2]);
+  const changed = await expectInstanceChange(a.client);
   const second = JSON.parse(await readFile(f.paths.connection, 'utf8'));
+  assert.equal(changed, second.instanceId);
+  assert.notEqual(second.instanceId, connection.instanceId);
   assert(second.agentToken !== connection.agentToken, 'A new instance uses fresh credentials');
+  assert.equal(await whoami(a.client), started[2]);
+  assert.equal(await expectInstanceChange(b.client), second.instanceId);
   assert.equal(await whoami(b.client), started[3]);
+});
+
+test('a force-terminated service leaves a stale record and the next process gets a new instance ID', { timeout: 30000 }, async t => {
+  const f = await fixture(t, false);
+  const { client } = await connectMcp(t, f.env);
+  const start = () => {
+    const processUnderTest = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
+      cwd: installRoot, env: f.env, windowsHide: true, stdio: 'ignore',
+    });
+    const closed = once(processUnderTest, 'close');
+    return {
+      pid: processUnderTest.pid,
+      async terminate() {
+        if (processUnderTest.exitCode === null && processUnderTest.signalCode === null) processUnderTest.kill('SIGKILL');
+        await closed;
+      },
+    };
+  };
+  async function discover(pid: number | undefined) {
+    for (let attempt = 0; attempt < 120; attempt++) {
+      const connection = await findService(f.paths);
+      if (connection?.pid === pid && connection?.instanceId) return connection;
+      await delay(50);
+    }
+    throw new Error('Test service did not publish its instance ID');
+  }
+  const original = start();
+  let replacement: ReturnType<typeof start> | undefined;
+  try {
+    const first = await discover(original.pid);
+    const taskId = await whoami(client);
+    await original.terminate();
+    assert.equal(JSON.parse(await readFile(f.paths.connection, 'utf8')).instanceId, first.instanceId);
+    assert.equal(await findService(f.paths), undefined);
+    replacement = start();
+    const next = await discover(replacement.pid);
+    assert.notEqual(next.instanceId, first.instanceId);
+    assert.equal(await expectInstanceChange(client), next.instanceId);
+    assert.equal(await whoami(client), taskId);
+  } finally {
+    await original.terminate();
+    await replacement?.terminate();
+  }
 });
 
 test('an incomplete discovery is replaced and a startup failure can be repaired and retried', { timeout: 35000 }, async t => {
@@ -134,6 +193,108 @@ test('stop rejects records copied from a different runtime and conservatively ha
   await assert.rejects(other.cli('server'), error => Boolean((error as { stderr?: string }).stderr?.includes('本地服务启动失败')));
   assert.equal(await readFile(other.paths.owner, 'utf8'), '');
   assert.equal(JSON.parse((await active.cli('status')).stdout).running, true);
+});
+
+test('a watcher switches generations without consuming the first active call warning', { timeout: 25000 }, async t => {
+  const f = await fixture(t, false);
+  const canonical = await realpath(f.paths.runtime);
+  const runtime = createHash('sha256').update(process.platform === 'win32' ? canonical.toLowerCase() : canonical).digest('hex');
+  const first = randomUUID(), second = randomUUID();
+  const agentToken = randomBytes(32).toString('hex');
+  const offline = Promise.withResolvers<void>();
+  const originalWatch = Promise.withResolvers<void>();
+  const replacementWatch = Promise.withResolvers<number>();
+  const releaseReplacementWatch = Promise.withResolvers<void>();
+  const activeProbe = Promise.withResolvers<void>();
+  const releaseActiveProbe = Promise.withResolvers<void>();
+  let available = true;
+  let holdActiveProbe = false;
+  let instanceId: string | undefined = first;
+  let port: number;
+  const writes: string[] = [];
+  const registrations = new Map<string | undefined, number>();
+  const broker = createServer(async (req, res) => {
+    if (req.headers.authorization !== `Bearer ${agentToken}`) { res.writeHead(401).end(); return; }
+    if (req.url === '/agent/instance') {
+      if (!available) { res.writeHead(503).end(); offline.resolve(); return; }
+      if (holdActiveProbe) { activeProbe.resolve(); await releaseActiveProbe.promise; }
+      res.end(JSON.stringify({ service: 'shared-ssh-terminal', runtime, pid: process.pid, port, address: '127.0.0.1', instanceId }));
+      return;
+    }
+    const generation = instanceId;
+    const body = [];
+    for await (const chunk of req) body.push(chunk);
+    const { action, after, data } = JSON.parse(Buffer.concat(body).toString());
+    if (action === 'register_agent') registrations.set(generation, (registrations.get(generation) ?? 0) + 1);
+    if (action === 'watch_messages') {
+      if (generation === first && after === 42) originalWatch.resolve();
+      if (generation === second) {
+        replacementWatch.resolve(after);
+        await releaseReplacementWatch.promise;
+      }
+      await delay(50);
+      res.end(JSON.stringify({ revision: 42, messages: [] }));
+    } else if (action === 'whoami') res.end(JSON.stringify({ id: req.headers['x-agent-id'] }));
+    else {
+      if (action === 'send_input') writes.push(data);
+      res.end('{}');
+    }
+  });
+  t.after(() => new Promise<void>(resolve => {
+    releaseReplacementWatch.resolve();
+    releaseActiveProbe.resolve();
+    broker.close(() => resolve());
+    broker.closeAllConnections();
+  }));
+  broker.listen(0, '127.0.0.1');
+  await once(broker, 'listening');
+  const address = broker.address();
+  assert(address && typeof address !== 'string');
+  port = address.port;
+  const publish = (id?: string) => writeFile(f.paths.connection, JSON.stringify({
+    agentToken, port, url: `http://127.0.0.1:${port}`, address: '127.0.0.1', pid: process.pid, instanceId: id,
+  }));
+  // Keep the same bearer, PID and endpoint throughout. Only the authenticated ID identifies a switch.
+  await publish(second);
+  assert.equal(await findService(f.paths), undefined);
+  await publish();
+  assert.equal(await findService(f.paths), undefined);
+  instanceId = undefined;
+  assert(await findService(f.paths), 'Records from the previous version remain discoverable');
+  instanceId = first;
+  await publish(first);
+
+  const { client } = await connectMcp(t, f.env);
+  const taskId = await whoami(client);
+  await originalWatch.promise;
+  available = false;
+  await offline.promise;
+  assert.equal(await findService(f.paths), undefined);
+  available = true;
+  assert.equal(await whoami(client), taskId);
+  assert.equal(registrations.get(first), 1);
+
+  instanceId = undefined;
+  await publish();
+  assert.equal(await whoami(client), taskId, 'Unknown legacy instance ID does not signal a switch');
+
+  instanceId = second;
+  await publish(second);
+  assert.equal(await replacementWatch.promise, 0, 'The first poll for the new instance must omit the old cursor');
+  const input = { sessionId: randomUUID(), lease: randomUUID(), data: 'do not submit' };
+  holdActiveProbe = true;
+  const warnings = Promise.all([expectInstanceChange(client, 'send_input', input), expectInstanceChange(client, 'send_input', input)]);
+  await activeProbe.promise;
+  await client.ping(); // Both tool requests have arrived on stdio while discovery remains unresolved.
+  releaseActiveProbe.resolve();
+  assert.deepEqual(await warnings, [second, second]);
+  assert.deepEqual(writes, []);
+  assert.equal(await whoami(client), taskId);
+  assert.equal(registrations.get(second), 1);
+  const next = await client.callTool({ name: 'send_input', arguments: { ...input, data: 'explicit next input' } });
+  assert.equal(next.isError, undefined);
+  assert.deepEqual(writes, ['explicit next input']);
+  releaseReplacementWatch.resolve();
 });
 
 test('a submitted send_input with a lost reply is reported once without replaying it', { timeout: 20000 }, async t => {

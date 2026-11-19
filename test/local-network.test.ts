@@ -40,8 +40,10 @@ async function startService(t: TestContext, preferredPort?: number, blockDiscove
     await rm(resolved, { recursive: true, force: true });
   });
   const runtime = path.join(directory, 'runtime');
+  const data = path.join(directory, 'data');
   if (blockDiscovery) await mkdir(path.join(runtime, 'connection.json'), { recursive: true });
-  const env: NodeJS.ProcessEnv = { ...process.env, SHARED_SSH_DATA_DIR: path.join(directory, 'data'), SHARED_SSH_RUNTIME_DIR: runtime };
+  const env: NodeJS.ProcessEnv = { ...process.env, SHARED_SSH_DATA_DIR: data, SHARED_SSH_RUNTIME_DIR: runtime };
+  for (const key of Object.keys(env)) if (key.startsWith('SHARED_SSH_LAN_')) delete env[key];
   if (preferredPort === undefined) delete env.SHARED_SSH_PORT;
   else env.SHARED_SSH_PORT = String(preferredPort);
   const child = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
@@ -74,23 +76,29 @@ async function startService(t: TestContext, preferredPort?: number, blockDiscove
       assert(/^[a-f0-9]{64}$/.test(connection.agentToken), 'Legacy agentToken is available');
       const { adminToken } = JSON.parse(await readFile(path.join(runtime, 'ui.json'), 'utf8'));
       assert(/^[a-f0-9]{64}$/.test(adminToken) && adminToken !== connection.agentToken, 'Management uses a distinct token');
-      return { port: connection.port as number, url: connection.url as string, adminToken };
+      return { port: connection.port as number, url: connection.url as string, adminToken,
+        agentToken: connection.agentToken as string, instanceId: connection.instanceId as string };
     }
     throw new Error('Timed out waiting for test service discovery');
   }
 
-  return { discover, runtime, closed, stderr: () => stderr };
+  return { discover, data, runtime, closed, stderr: () => stderr };
 }
 
 async function wsSynced(authority: string, cookie: string) {
   const ws = new WebSocket(`ws://${authority}/terminal`, { origin: `http://${authority}`, headers: { cookie }, handshakeTimeout: 3000 });
   try {
-    const synced = new Promise<void>((resolve, reject) => {
-      ws.on('message', raw => { if (JSON.parse(raw.toString()).type === 'synced') resolve(); });
+    const synced = new Promise<string | undefined>((resolve, reject) => {
+      let instanceId: string | undefined;
+      ws.on('message', raw => {
+        const message = JSON.parse(raw.toString());
+        if (message.type === 'hello') instanceId = message.instanceId;
+        if (message.type === 'synced') resolve(instanceId);
+      });
       ws.once('error', reject);
       ws.once('close', code => reject(new Error(`WebSocket closed before sync: ${code}`)));
     });
-    await synced;
+    return await synced;
   } finally { ws.terminate(); }
 }
 
@@ -120,8 +128,14 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
   const preferred = await reservePort(0);
   t.after(preferred.close);
   const service = await startService(t, preferred.port);
-  const { port, url, adminToken } = await service.discover();
+  const { port, url, adminToken, agentToken, instanceId } = await service.discover();
   assert.notEqual(port, preferred.port);
+  assert.match(instanceId, /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/);
+  assert.equal((await fetch(`${url}/agent/instance`)).status, 401);
+  assert.equal((await fetch(`${url}/agent/instance`, { headers: { authorization: `Bearer ${adminToken}` } })).status, 401);
+  const instance = await fetch(`${url}/agent/instance`, { headers: { authorization: `Bearer ${agentToken}` } });
+  assert.equal(instance.status, 200);
+  assert.equal((await instance.json()).instanceId, instanceId);
   const authorization = `Bearer ${adminToken}`;
   const status = (target: string, headers: OutgoingHttpHeaders | string[] = {}, method = 'GET') => new Promise<number | undefined>((resolve, reject) => {
     const req = request(target, { headers, method, signal: AbortSignal.timeout(3000) }, response => {
@@ -143,7 +157,8 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
     assert.equal(redeemed.status, 204);
     const cookie = redeemed.headers.get('set-cookie')!.split(';')[0];
     assert.equal(await status(`${origin}/api/state`, { cookie }), 200);
-    await wsSynced(authority, cookie);
+    assert.equal(await wsSynced(authority, cookie), instanceId);
+    assert.equal(await wsSynced(authority, cookie), instanceId);
   }
   assert.equal(await status(`${url}/api/state`, { authorization }), 401);
   assert.equal(await status(`${url}/api/state`), 401);
@@ -174,7 +189,7 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
   const client = new Client({ name: 'local-network-test', version: '1.0.0' });
   const transport = new StdioClientTransport({
     command: process.execPath, args: ['--import', 'tsx', 'src/mcp.ts'], cwd,
-    env: { SHARED_SSH_RUNTIME_DIR: service.runtime }, stderr: 'ignore',
+    env: { SHARED_SSH_DATA_DIR: service.data, SHARED_SSH_RUNTIME_DIR: service.runtime }, stderr: 'ignore',
   });
   try {
     await client.connect(transport, { timeout: 5000 });

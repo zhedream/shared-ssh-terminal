@@ -28,6 +28,9 @@ try {
 function saveDismissedTabs() { try { localStorage.setItem(dismissedStorageKey, JSON.stringify([...dismissedTabs].slice(-1000).sort())); } catch {} }
 let profiles = [], activeId = null, socket, clientId, ready = false, reconnectTimer, toastTimer;
 let pairing = false, checkingAuth = false;
+let confirmedInstanceId;
+let confirmedOpenSessions = new Set();
+let addressAdviceTimer;
 function toast(message) { $('toast').textContent = message; $('toast').classList.remove('hidden'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').classList.add('hidden'), 6500); }
 async function api(route, options = {}) {
   if (!ready) throw new Error('请先连接共端');
@@ -53,6 +56,7 @@ function request(type, args = {}) {
 function getActive() { const s = sessions.get(activeId); if (!s) throw new Error('请先建立连接'); return s; }
 function canReloadUi() {
   return !pairing && !checkingAuth && !$('pair-code').value && !pending.size &&
+    $('restart-notice').classList.contains('hidden') &&
     ![...messageDrafts.values()].some(d => d.text) &&
     ![...terminals.values()].some(t => t.sending || t.input) &&
     !document.querySelector('dialog[open]');
@@ -100,6 +104,10 @@ function renderProfiles() {
   }
 }
 function updateSession(s) {
+  if (ready) {
+    if (s.status === 'open') confirmedOpenSessions.add(s.id);
+    else confirmedOpenSessions.delete(s.id);
+  }
   if (s.status === 'closed' && dismissedTabs.has(s.id)) {
     if (sessions.has(s.id)) { sessions.set(s.id, s); dismissClosedTab(s.id, false); }
     return;
@@ -155,7 +163,7 @@ function renderActive() {
   const mine = s.lock?.kind === 'user' && s.lock.owner === clientId;
   $('session-ownership').textContent = `创建：${s.createdBy?.kind === 'agent' ? actorLabel(s.createdBy.agent) : '用户'}　｜　关联 Agent：${actorLabel(s.assignedTo)}`;
   let banner = s.assignedTo ? `共享画面 · ${actorLabel(s.assignedTo)} 可观察当前画面和滚动历史；输入一次只由一方控制。` : '用户会话 / 待交接 · 复制 sessionId 给指定 Agent 认领；输入权由所有页面和已关联 Agent 共用一把锁。', kind = '';
-  if (!ready) { banner = '界面连接已断开，SSH 会话由本地服务继续维护。正在重新连接…'; kind = 'private'; }
+  if (!ready) { banner = '与共端服务的连接已中断，正在重连。SSH 状态将在连接后确认。'; kind = 'private'; }
   else if (s.status === 'closed') banner = 'SSH 连接已关闭。可查看已有输出，或点击页签右侧 × 移除此页签；重新连接请使用左侧服务器列表。';
   else if (s.privateMode) { banner = `私密已开启 · Agent 无权观察或输入，屏幕仍保留。${s.lock && !mine ? '输入由另一方持有，请点击「接管输入权」后操作。' : '关闭私密后，当前画面和仍保留的历史将可被 Agent 看到。'}`; kind = 'private'; }
   else if (s.handoff) {
@@ -270,6 +278,7 @@ function updatePairControls() {
   $('pair-check').disabled = busy;
 }
 function showPairing(message) {
+  clearAddressAdvice();
   const panel = $('pair-panel');
   $('workspace').classList.add('hidden');
   $('workspace').inert = true;
@@ -306,8 +315,16 @@ function showPairing(message) {
   panel.classList.remove('hidden');
   if (!$('pair-code').disabled) $('pair-code').focus();
 }
-function scheduleReconnect() {
-  $('connection-text').textContent = '连接暂时中断，正在重新检查…';
+function clearAddressAdvice() {
+  clearTimeout(addressAdviceTimer);
+  addressAdviceTimer = undefined;
+  $('connection-advice').classList.add('hidden');
+}
+function scheduleReconnect(unreachable = false) {
+  $('connection-text').textContent = '正在重新连接共端…';
+  if (unreachable && addressAdviceTimer === undefined) {
+    addressAdviceTimer = setTimeout(() => $('connection-advice').classList.remove('hidden'), 8000);
+  }
   clearTimeout(reconnectTimer);
   reconnectTimer = setTimeout(() => void connect(), 2000);
 }
@@ -320,13 +337,14 @@ async function connect(afterPair = false) {
   try {
     response = await fetch('/api/auth', { credentials: 'same-origin', cache: 'no-store', signal: AbortSignal.timeout(10000) });
   } catch {
-    scheduleReconnect();
+    scheduleReconnect(true);
     if (!$('pair-panel').classList.contains('hidden')) $('pair-status').textContent = '暂时无法连接共端。请稍后重新检查连接。';
     return;
   } finally {
     checkingAuth = false;
     updatePairControls();
   }
+  clearAddressAdvice();
   if (response.status === 401) {
     showPairing(afterPair ? '配对请求已完成，但浏览器未保留登录状态。请允许此站点使用 Cookie，再生成新配对码。' : '此浏览器尚未配对，或登录状态已失效。');
     return;
@@ -386,25 +404,67 @@ async function redeemPairing(code) {
 function openTerminalSocket(url) {
   const connection = new WebSocket(url);
   socket = connection;
+  let hello;
+  let initialEvents = [];
+  let synchronized = false;
   // The browser sends its Cookie with the upgrade. Wait for the initial sync before enabling writes.
   const syncTimeout = setTimeout(() => connection.close(), 10000);
   connection.addEventListener('message', event => {
     if (socket !== connection || connection.readyState !== WebSocket.OPEN) return;
     const p = JSON.parse(event.data);
+    if (synchronized) {
+      if (p.type !== 'hello' && p.type !== 'synced') applyPacket(p);
+      return;
+    }
     if (p.type === 'hello') {
-      refreshUpdatedUi(p.uiVersion);
+      hello = p;
+      initialEvents = [];
+    } else if (hello && p.type === 'synced') {
+      applyPacket(hello);
+      for (const initialEvent of initialEvents) applyPacket(initialEvent);
+      initialEvents = [];
+      synchronized = true;
+      applyPacket(p);
+    } else if (hello) {
+      initialEvents.push(p);
+    }
+  });
+  function pruneSessionViews(serverIds) {
+    if (historySessionId && !serverIds.has(historySessionId)) {
+      invalidateHistory('会话已移除');
+      $('history-dialog').close();
+      historySessionId = undefined;
+    }
+    for (const view of [sessionMessages, messageDrafts, normalHistoryRevisions]) {
+      for (const id of view.keys()) if (!serverIds.has(id)) view.delete(id);
+    }
+    for (const [id, t] of terminals) {
+      if (serverIds.has(id)) continue;
+      t.term.dispose();
+      t.pane.remove();
+      terminals.delete(id);
+      sessions.delete(id);
+    }
+    if (!serverIds.has(activeId)) activeId = null;
+  }
+  function applyPacket(p) {
+    if (p.type === 'hello') {
       clientId = p.clientId; profiles = p.profiles;
-      const serverIds = new Set(p.sessions.map(s => s.id));
-      if (historySessionId && !serverIds.has(historySessionId)) { invalidateHistory('会话已移除'); $('history-dialog').close(); }
-      for (const id of sessionMessages.keys()) if (!serverIds.has(id)) { sessionMessages.delete(id); messageDrafts.delete(id); }
-      dismissedTabs = new Set([...dismissedTabs].filter(id => serverIds.has(id)));
-      saveDismissedTabs();
-      const ids = new Set(p.sessions.filter(s => s.status !== 'closed' || !dismissedTabs.has(s.id)).map(s => s.id));
-      for (const [id, t] of terminals) if (!ids.has(id)) { t.term.dispose(); t.pane.remove(); terminals.delete(id); sessions.delete(id); }
-      if (!ids.has(activeId)) activeId = null;
       for (const s of p.sessions) { updateSession(s); terminals.get(s.id)?.term.reset(); }
     } else if (p.type === 'synced') {
       clearTimeout(syncTimeout);
+      const instanceId = typeof hello.instanceId === 'string' && hello.instanceId ? hello.instanceId : undefined;
+      const currentIds = new Set(p.sessions.map(s => s.id));
+      if (confirmedInstanceId && instanceId && confirmedInstanceId !== instanceId &&
+          [...confirmedOpenSessions].some(id => !currentIds.has(id))) {
+        $('restart-notice').classList.remove('hidden');
+        for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
+      }
+      confirmedInstanceId = instanceId;
+      confirmedOpenSessions = new Set(p.sessions.filter(s => s.status === 'open').map(s => s.id));
+      pruneSessionViews(currentIds);
+      dismissedTabs = new Set([...dismissedTabs].filter(id => currentIds.has(id)));
+      saveDismissedTabs();
       $('workspace').classList.remove('hidden');
       $('workspace').inert = false;
       ready = true; for (const s of p.sessions) updateSession(s);
@@ -412,7 +472,9 @@ function openTerminalSocket(url) {
         const restored = sessionStorage.getItem('shared-ssh-active-tab'); sessionStorage.removeItem('shared-ssh-active-tab');
         if (sessions.has(restored)) activate(restored);
       } catch {}
-      $('connection-dot').classList.add('connected'); $('connection-text').textContent = '本地服务已连接'; renderProfiles(); renderActive(); setTimeout(fitActive, 30);
+      $('connection-dot').classList.add('connected'); $('connection-text').textContent = '本地服务已连接'; renderProfiles(); renderTabs(); renderActive(); setTimeout(fitActive, 30);
+      refreshUpdatedUi(hello.uiVersion);
+      hello = undefined;
     } else if (p.type === 'state') updateSession(p.session);
     else if (p.type === 'profiles') { profiles = p.profiles; renderProfiles(); }
     else if (p.type === 'messages') { sessionMessages.set(p.sessionId, p.messages); if (p.sessionId === activeId) renderMessages(); }
@@ -443,11 +505,13 @@ function openTerminalSocket(url) {
       const item = pending.get(p.requestId); if (item) { clearTimeout(item.timer); pending.delete(p.requestId); if (p.type === 'ack') item.resolve(p.result); else item.reject(new Error(p.error)); }
       else if (p.type === 'error') toast(p.error);
     }
-  });
+  }
   connection.addEventListener('close', () => {
     clearTimeout(syncTimeout);
     if (socket !== connection) return;
     socket = undefined;
+    hello = undefined;
+    initialEvents = [];
     ready = false; $('connection-dot').classList.remove('connected');
     $('workspace').inert = true;
     for (const t of terminals.values()) { t.input = ''; clearTimeout(t.schedule); t.schedule = null; }
@@ -640,6 +704,7 @@ $('pair-form').addEventListener('submit', event => {
   void redeemPairing($('pair-code').value.trim());
 });
 $('pair-check').addEventListener('click', () => { if (!pairing) void connect(); });
+$('dismiss-restart-notice').addEventListener('click', () => $('restart-notice').classList.add('hidden'));
 
 {
   const launchCode = takeLaunchCode();

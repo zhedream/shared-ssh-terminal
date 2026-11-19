@@ -42,3 +42,21 @@
   overflow: auto;
   white-space: pre-wrap;
 }
+
+.connection-advice {
+  margin: 3px 0 0;
+  max-width: 540px;
+  color: #d5bb8a;
+  overflow-wrap: anywhere;
+}
+.restart-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+  padding: 8px 18px;
+  border-bottom: 1px solid #493b27;
+  background: #2c2418;
+  color: #efd9ad;
+}
+.restart-notice button { margin-left: auto; }

@@ -25,8 +25,9 @@ const uiVersion = createHash('sha256').update(Buffer.concat(await Promise.all(
 ))).digest('hex').slice(0, 16);
 const paths = servicePaths();
 const { data: DATA, runtime: RUNTIME } = paths;
+const instanceId = randomUUID();
 let serviceLock: Awaited<ReturnType<typeof acquireServiceLock>>;
-let instance: { service: string; runtime: string; pid: number; address: string; port: number; lan?: LanDiscovery } | undefined;
+let instance: { service: string; runtime: string; pid: number; address: string; port: number; instanceId: string; lan?: LanDiscovery } | undefined;
 let lanServer: https.Server | undefined;
 class ServiceBusy extends Error {}
 const token = () => randomBytes(32).toString('hex');
@@ -387,7 +388,7 @@ async function syncBrowser(ws: WebSocket, clientId: string) {
   const pending: any[] = [];
   synchronizing.set(ws, pending);
   try {
-    send(ws, { type: 'hello', uiVersion, clientId, profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
+    send(ws, { type: 'hello', instanceId, uiVersion, clientId, profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
     const boundaries = new Map<string, number>();
     for (const s of sessions.values()) {
       const snapshot = await s.snapshot();
@@ -435,8 +436,8 @@ async function main() {
     }
     await writeRuntimeJson(paths.ui, { adminToken });
     uiPublished = true;
-    await writeRuntimeJson(paths.connection, { url, agentToken, pid: process.pid, address, port, lan });
-    instance = { service: SERVICE_NAME, runtime: serviceLock.id, pid: process.pid, address, port, lan };
+    await writeRuntimeJson(paths.connection, { url, agentToken, pid: process.pid, address, port, instanceId, lan });
+    instance = { service: SERVICE_NAME, runtime: serviceLock.id, pid: process.pid, address, port, instanceId, lan };
     console.log(`共享 SSH 终端已启动 (${address}:${port})`);
     if (lan) console.log(`局域网浏览器入口 ${lan.origin}。可访问该地址的设备可以尝试连接，请仅在信任的网络启用。`);
   } catch (error) {

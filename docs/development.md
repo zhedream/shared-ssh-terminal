@@ -27,6 +27,12 @@ $env:SHARED_SSH_DATA_DIR = Join-Path (Get-Location).Path 'data'
 
 MCP 客户端可运行 `shared-ssh-terminal mcp`，源码安装也可用 `node` 加 `dist/mcp.js` 的绝对路径。已有 `Register-MCP.ps1` 配置可沿用该入口。首次工具调用会查找或启动同目录的服务。`status` 输出 `running`、`address`、`port`，运行时另有 `pid`。若无法确认实例身份，命令报错并提示核对目录和服务日志。
 
+## 服务实例变化与重连
+
+浏览器与本机服务失联时先等待重新同步。原地址持续不可达时，在共端主机运行 `shared-ssh-terminal status`，使用返回的回环地址或 `lan.origin`。收到 401 后使用现有浏览器配对入口。同一实例仍有旧 SSH 时，重新同步即可恢复画面和当前会话状态。当前页确认实例变化且旧会话已不可用时，从「服务器 → 连接 ↗」建立新 SSH。
+
+同一个 MCP 适配进程首次发现已确认的 `instanceId` 变化时，会在主动操作提交前返回 `service_instance_changed`，结果带当前实例 ID 与说明。下一次可用 `list_sessions` 核对会话，或用 `create_session` 明确建立新 SSH。本机服务暂不可达时仍按连接或启动失败报告。后台仅等候服务，轮询可重新注册原任务和从新实例起点读取消息状态，首次主动调用仍会收到切换提示。新实例只保留原本持久化的配置和凭据，旧会话、终端画面、消息、lease、分页游标和输入不随实例迁移。
+
 ## 技能安装和卸载
 
 在安装本地包的机器上选择 `codex`、`claude`、`cursor` 或 `all`。源码构建后，在同样的参数前使用 `node <项目绝对路径>/dist/cli.js`。MCP 登记用 Node 和安装位置的绝对路径，换工作目录也可启动。旧版 `Register-MCP.ps1` 创建的同名条目由用户保管。如需迁移，请先备份并核对旧条目，再手动解除旧登记。
@@ -115,7 +121,7 @@ if ($resolvedFixture.StartsWith($fixturePrefix, [StringComparison]::OrdinalIgnor
 | --- | --- |
 | npm run build | TypeScript 类型和输出 |
 | npm test | 本机与局域网端口、发现、配对、HTTP／WS 权限、并发 CLI／MCP 首连与重连、会话及按钮状态。局域网集成测试使用临时证书、OpenSSL 和具体私有 IPv4 接口 |
-| npm run test:e2e | 本机 OpenSSH/SSH2/ConPTY、密码/密钥/保存密码、真实 Vim、跨页面、多个 MCP 进程、独立消息与标准通知 |
+| npm run test:e2e | 本机 OpenSSH/SSH2/ConPTY、密码/密钥/保存密码、真实 Vim、跨页面、多个 MCP 进程、独立消息与标准通知、同实例浏览器重连和服务重启后显式新建 SSH |
 | node scripts/shell-smoke.mjs | 本机 Bash 原始输入；设置 SST_TEST_ZSH 可加测 Zsh |
 | npm run check:docs | 所有文档索引和相对引用 |
 | npm run check:publish | Git 暂存版本中的私密目录、主机、本机路径和常见凭据 |

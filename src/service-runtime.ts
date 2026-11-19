@@ -20,6 +20,7 @@ const bearerSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const connectionSchema = z.object({
   url: z.string(), agentToken: bearerSchema, pid: pidSchema,
   address: z.literal(LOCAL_ADDRESS), port: z.number().int().min(1024).max(65535),
+  instanceId: z.string().uuid().optional(),
   lan: lanDiscoverySchema.optional(),
 }).refine(c => c.url === `http://${c.address}:${c.port}`);
 export type ServiceConnection = z.infer<typeof connectionSchema>;
@@ -167,12 +168,13 @@ export async function findService(paths: ServicePaths, signal?: AbortSignal): Pr
     const response = await loopbackRequest(connection, '/agent/instance', connection.agentToken, 'GET',
       signal ? AbortSignal.any([signal, timeout]) : timeout);
     if (response.status !== 200) return;
-    const { service, runtime, pid, address, port, lan } = JSON.parse(response.body);
+    const { service, runtime, pid, address, port, instanceId, lan } = JSON.parse(response.body);
     const expectedLan = connection.lan;
     const lanMatches = expectedLan
       ? lan?.address === expectedLan.address && lan?.port === expectedLan.port && lan?.origin === expectedLan.origin
       : lan === undefined;
-    if (service === SERVICE_NAME && runtime === id && pid === connection.pid && address === connection.address && port === connection.port && lanMatches) {
+    if (service === SERVICE_NAME && runtime === id && pid === connection.pid && address === connection.address &&
+        port === connection.port && instanceId === connection.instanceId && lanMatches) {
       return connection;
     }
   } catch { signal?.throwIfAborted(); }

@@ -2,34 +2,57 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { AgentIdentity } from './agents.js';
 import { servicePaths } from './paths.js';
 import { ensureService, findService, RuntimeError, runtimeErrorMessage, type ServiceConnection } from './service-runtime.js';
 
 const paths = servicePaths();
 const server = new McpServer({ name: 'shared-ssh-terminal', version: '0.6.0' }, { capabilities: { logging: {} } });
-type Context = { identity: AgentIdentity; secret: string; registered?: string; registering?: { token: string; promise: Promise<void> }; watching?: boolean };
+type ConnectionIdentity = Pick<ServiceConnection, 'agentToken' | 'instanceId'>;
+type Context = { identity: AgentIdentity; secret: string; registration?: { connection: ConnectionIdentity; promise: Promise<void> }; watching?: boolean };
 const contexts = new Map<string, Context>();
 let defaultContext: Context | undefined;
 let closed = false;
 const shutdown = new AbortController();
 server.server.onclose = () => { closed = true; shutdown.abort(); };
 let preparing: Promise<ServiceConnection> | undefined;
+let confirmedInstanceId: string | undefined;
 class HandoffPending extends RuntimeError {}
+class ServiceInstanceChanged extends RuntimeError {
+  constructor(readonly instanceId: string) {
+    super('本地服务已切换到新实例，本次操作未提交。请先用 list_sessions 核对会话，或显式用 create_session 建立新 SSH。');
+  }
+}
 function prepareService() {
-  return preparing ??= ensureService(paths, shutdown.signal).finally(() => { preparing = undefined; });
+  // Calls already awaiting the first discovery of a new instance all stop before posting.
+  return preparing ??= ensureService(paths, shutdown.signal).then(connection => {
+    const { instanceId } = connection;
+    if (instanceId) {
+      const previous = confirmedInstanceId;
+      confirmedInstanceId = instanceId;
+      if (previous && previous !== instanceId) throw new ServiceInstanceChanged(instanceId);
+    }
+    return connection;
+  }).finally(() => { preparing = undefined; });
+}
+function sameConnection(previous: ConnectionIdentity | undefined, current: ConnectionIdentity) {
+  return previous?.agentToken === current.agentToken && previous.instanceId === current.instanceId;
 }
 function watch(context: Context) {
   if (context.watching || closed) return;
   context.watching = true;
   void (async () => {
-    let revision = 0, generation: string | undefined;
+    let revision = 0;
+    let generation: ConnectionIdentity | undefined;
     const notified = new Set<string>();
     while (!closed) {
-      if (generation !== context.registered) { generation = context.registered; revision = 0; notified.clear(); }
-      const response = await request('watch_messages', { agentId: context.identity.id, after: revision, waitMs: 15000 });
+      const connection = await findService(paths, shutdown.signal).catch(() => undefined);
+      if (!connection) { await delay(2000, undefined, { signal: shutdown.signal }); continue; }
+      if (!sameConnection(generation, connection)) { generation = connection; revision = 0; notified.clear(); }
+      const response = await request('watch_messages', { agentId: context.identity.id, after: revision, waitMs: 15000 }, connection);
       if (closed) break;
-      if (response.isError) { await new Promise(resolve => setTimeout(resolve, 2000)); continue; }
+      if (response.isError) { await delay(2000, undefined, { signal: shutdown.signal }); continue; }
       const result = JSON.parse(response.content[0].text);
       revision = result.revision;
       const live = new Set<string>(result.messages.map((m: { id: string }) => m.id));
@@ -60,15 +83,15 @@ function contextFor(id?: unknown) {
   if (!context) throw new RuntimeError('此 agentId 不属于当前 MCP 适配实例，请使用 whoami 或 register_agent 返回的 ID');
   return context;
 }
-async function request(action: string, args: Record<string, unknown>) {
+async function request(action: string, args: Record<string, unknown>, watchConnection?: ServiceConnection) {
   try {
     const context = contextFor(args.agentId);
-    const connection = action === 'watch_messages' ? await findService(paths, shutdown.signal) : await prepareService();
-    if (!connection) throw new RuntimeError('本地服务尚未就绪。');
+    const connection = watchConnection ?? await prepareService();
     let unreadCount = 0;
     const post = async (value: unknown) => {
+      // A restarted service may reuse the same port while the old listener drains requests.
       const response = await fetch(new URL('/agent', connection.url), {
-        method: 'POST', headers: { Authorization: `Bearer ${connection.agentToken}`, 'Content-Type': 'application/json',
+        method: 'POST', headers: { Authorization: `Bearer ${connection.agentToken}`, 'Content-Type': 'application/json', Connection: 'close',
           'X-Agent-Id': context.identity.id, 'X-Agent-Token': context.secret },
         body: JSON.stringify(value), signal: AbortSignal.any([AbortSignal.timeout(20000), shutdown.signal]), redirect: 'error'
       });
@@ -80,16 +103,15 @@ async function request(action: string, args: Record<string, unknown>) {
       unreadCount = Number(response.headers.get('X-Shared-Ssh-Unread-Count') || 0);
       return result;
     };
-    if (context.registered !== connection.agentToken) {
-      if (context.registering?.token !== connection.agentToken) {
-        const promise = post({ action: 'register_agent', identity: context.identity, secret: context.secret }).then(() => {
-          if (context.registering?.promise === promise) context.registered = connection.agentToken;
-        }).finally(() => {
-          if (context.registering?.promise === promise) context.registering = undefined;
-        });
-        context.registering = { token: connection.agentToken, promise };
-      }
-      await context.registering.promise;
+    const registered = context.registration;
+    if (registered && sameConnection(registered.connection, connection)) await registered.promise;
+    else {
+      const promise = post({ action: 'register_agent', identity: context.identity, secret: context.secret }).then(() => {}).catch(error => {
+        if (context.registration?.promise === promise) context.registration = undefined;
+        throw error;
+      });
+      context.registration = { connection, promise };
+      await promise;
     }
     const { agentId, ...parameters } = args;
     // Resolve and register before sending the action. A lost response does not
@@ -103,8 +125,10 @@ async function request(action: string, args: Record<string, unknown>) {
     }
     return { content };
   } catch (e) {
-    if (e instanceof HandoffPending) {
-      const details = { code: 'handed_to_user', error: e.message };
+    if (e instanceof HandoffPending || e instanceof ServiceInstanceChanged) {
+      const details = e instanceof ServiceInstanceChanged
+        ? { code: 'service_instance_changed', instanceId: e.instanceId, error: e.message }
+        : { code: 'handed_to_user', error: e.message };
       return { isError: true, structuredContent: details, content: [{ type: 'text' as const, text: JSON.stringify(details) }] };
     }
     const error = e instanceof TypeError ? '本地服务连接中断，请先核对当前会话再继续操作。' : runtimeErrorMessage(e);

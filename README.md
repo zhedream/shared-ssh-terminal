@@ -65,7 +65,7 @@ Agent 持锁时可以用 `handoff_to_user` 把运行中的终端交给用户。�
 - “清空全部历史”同步清空当前屏幕、滚动历史和备用屏幕，用户与 MCP 均不能再读取已清内容；不发送 Shell 清屏命令，不改变锁或私密状态。
 - 清空不能撤回已进入 Agent 聊天上下文的内容，也不能阻止远端将同一内容重新输出。
 - 已关闭页签点击 × 后，所有页面同步移除，服务不再提供该会话的历史；移除活动连接必须先关闭。
-- 双击 `stop.cmd` 停止当前运行目录的本地服务并关闭其所有 SSH。服务重启后，服务器配置仍可使用，需要重新连接 SSH。
+- 双击 `stop.cmd` 停止当前运行目录的本地服务并关闭其所有 SSH。当前页确认服务已更换实例、且旧会话不在新清单中时，会提示旧会话不可恢复。服务器配置仍可使用，从「服务器 → 连接 ↗」建立新 SSH。
 - 页面会检测界面版本，在无待发送输入和编辑弹窗时刷新，保留选中页签。仅刷新网页不会结束 SSH。
 
 ## 保存密码与自动登录
@@ -83,6 +83,8 @@ Agent 持锁时可以用 `handoff_to_user` 把运行中的终端交给用户。�
 本地安装后运行 `shared-ssh-terminal install-skill --agent codex|claude|cursor|all`，为所选客户端安装使用说明入口并登记 MCP。`shared-ssh-terminal skill` 打印与已安装版本一致的操作说明。用 `uninstall-skill --agent …` 撤销本工具管理的登记。已有配置变更前会先备份。[技能安装和卸载](docs/development.md#技能安装和卸载)
 
 每个应用启动独立 stdio 适配进程，首次工具调用按同一运行目录查找服务，必要时启动后台实例。既有 `Register-MCP.ps1` 生成的 Codex 登记仍可使用。
+
+同一适配进程发现服务实例已更换后，首次主动调用在提交前返回 `service_instance_changed` 和当前 `instanceId`。用 `list_sessions` 核对当前会话，或用 `create_session` 明确建立新 SSH。短暂断线时会话结局仍需确认。适配进程保留自己的任务身份，但已经发出的输入不会自动重试。
 
 同一应用的不同项目或聊天先 `register_agent`，保存 id，后续每次调用传 `agentId`。默认 `list_sessions` 只列出自己的会话；`scope=all` 只列元数据，不授予访问权限。用户会话必须获得用户提供的 sessionId 才能认领。
 

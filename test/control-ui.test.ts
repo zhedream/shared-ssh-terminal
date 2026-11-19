@@ -369,3 +369,91 @@ test('explicit return sends the current revision only from an eligible page and 
   await page.settle();
   assert.equal(hidden(), true);
 });
+
+async function recoveryFixture(instanceId?: string) {
+  const page = mockBrowser('http://localhost:43219/');
+  const session = { id: 'old-session', status: 'open', cols: 80, rows: 24, revision: 4 };
+  page.replies.push(204);
+  page.start();
+  await page.settle();
+  const first = page.sockets[0];
+  first.open();
+  first.receive({ type: 'hello', clientId: 'old-page', instanceId, profiles: [], sessions: [session] });
+  first.receive({ type: 'snapshot', sessionId: session.id, cols: 80, rows: 24, data: 'original terminal' });
+  first.receive({ type: 'synced', sessions: [session] });
+  async function reconnect() {
+    page.replies.push(204);
+    page.runTimer(2000);
+    await page.settle();
+    const socket = page.sockets.at(-1)!;
+    socket.open();
+    return socket;
+  }
+  return { page, session, first, reconnect };
+}
+
+test('interrupted hello and stale sockets do not change the confirmed view; same instance restores the original session', async () => {
+  const { page, session, first, reconnect } = await recoveryFixture('instance-a');
+  first.close();
+  assert.match(page.node('status-banner').textContent, /SSH 状态将在连接后确认/);
+  const abandoned = await reconnect();
+  abandoned.receive({ type: 'hello', clientId: 'abandoned', instanceId: 'instance-b', profiles: [], sessions: [] });
+  assert.equal(page.node('restart-notice').classList.contains('hidden'), true);
+  assert.equal(page.node('tabs').children.length, 1);
+  assert.equal(page.displays[0].text, 'original terminal');
+  abandoned.close();
+  const current = await reconnect();
+  abandoned.receive({ type: 'synced', sessions: [] });
+  const updated = { ...session, privateMode: true, revision: 8 };
+  current.receive({ type: 'hello', clientId: 'current', instanceId: 'instance-a', profiles: [], sessions: [updated] });
+  current.receive({ type: 'snapshot', sessionId: session.id, cols: 80, rows: 24, data: 'restored terminal' });
+  assert.equal(page.displays[0].text, 'original terminal');
+  assert.equal(page.node('workspace').inert, true);
+  current.receive({ type: 'synced', sessions: [updated] });
+  assert.equal(page.displays[0].text, 'restored terminal');
+  assert.match(page.node('status-banner').textContent, /^私密已开启/);
+  assert.equal(page.node('restart-notice').classList.contains('hidden'), true);
+  assert.deepEqual(current.frames, []);
+});
+
+test('a restart notice requires two known instance IDs, committed sync, and a missing old open session', async () => {
+  for (const [previous, current, expected] of [
+    ['instance-a', 'instance-b', true],
+    ['instance-a', 'instance-a', false],
+    ['instance-a', undefined, false],
+    [undefined, 'instance-b', false],
+  ] as const) {
+    const { page, first, reconnect, session } = await recoveryFixture(previous);
+    first.close();
+    const ws = await reconnect();
+    ws.receive({ type: 'hello', clientId: 'new-page', instanceId: current, profiles: [], sessions: [session] });
+    assert.equal(page.node('restart-notice').classList.contains('hidden'), true);
+    assert.equal(page.node('tabs').children.length, 1);
+    ws.receive({ type: 'synced', sessions: [] });
+    assert.equal(page.node('restart-notice').classList.contains('hidden'), !expected);
+    assert.equal(page.node('tabs').children.length, 0);
+    assert.equal(page.displays[0].disposed, true);
+    assert.deepEqual(ws.frames, []);
+    page.node('dismiss-restart-notice').fire('click');
+    assert.equal(page.node('restart-notice').classList.contains('hidden'), true);
+  }
+});
+
+test('address advice waits for persistent network errors and clears when auth returns 401', async () => {
+  const { page, first } = await recoveryFixture('instance-a');
+  first.close();
+  page.replies.push('offline', 'offline', 401);
+  page.runTimer(2000);
+  await page.settle();
+  assert.equal(page.node('connection-advice').classList.contains('hidden'), true);
+  page.runTimer(2000);
+  await page.settle();
+  page.runTimer(8000);
+  assert.equal(page.node('connection-advice').classList.contains('hidden'), false);
+  assert.equal(page.node('pair-panel').classList.contains('hidden'), true);
+  page.runTimer(2000);
+  await page.settle();
+  assert.equal(page.node('connection-advice').classList.contains('hidden'), true);
+  assert.equal(page.node('pair-panel').classList.contains('hidden'), false);
+  assert.equal(page.node('restart-notice').classList.contains('hidden'), true);
+});
