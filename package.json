@@ -2,6 +2,7 @@
   "name": "shared-ssh-terminal",
   "version": "0.6.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Local shared SSH terminal with browser and MCP clients",
   "bin": { "shared-ssh-terminal": "dist/cli.js" },
