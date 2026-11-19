@@ -27,15 +27,16 @@ async function main(args: string[]) {
     if (args[1] && process.platform !== 'win32') throw new RuntimeError('--open 仅支持 Windows，请在 Windows 使用旧入口打开页面。');
     const service = await ensureService(paths);
     if (args[1]) await openBrowser(await pairingUrl(paths, service));
-    console.log(JSON.stringify({ running: true, address: service.address, port: service.port, pid: service.pid }));
+    console.log(JSON.stringify({ running: true, address: service.address, port: service.port, pid: service.pid, lan: service.lan }));
+    if (service.lan) console.error(`局域网浏览器入口 ${service.lan.origin}。可访问该地址的设备可以尝试连接，请仅在信任的网络启用。`);
     return;
   }
   if (args.length === 1 && command === 'status') {
     console.log(JSON.stringify(await serviceStatus(paths)));
     return;
   }
-  if (args.length === 1 && command === 'pair') {
-    console.log(await pairingUrl(paths, await ensureService(paths)));
+  if (command === 'pair' && (args.length === 1 || (args.length === 2 && args[1] === '--lan'))) {
+    console.log(await pairingUrl(paths, await ensureService(paths), args[1] === '--lan'));
     return;
   }
   if (args.length === 1 && command === 'stop') {
@@ -44,7 +45,7 @@ async function main(args: string[]) {
     console.log(JSON.stringify({ stopped }));
     return;
   }
-  const usage = '用法: shared-ssh-terminal server [--open] | status | pair | mcp | stop';
+  const usage = '用法: shared-ssh-terminal server [--open] | status | pair [--lan] | mcp | stop';
   if (!args.length || (args.length === 1 && command === '--help')) { console.log(usage); return; }
   throw new RuntimeError(usage);
 }

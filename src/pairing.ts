@@ -7,6 +7,7 @@ const codeLifetime = 5 * 60_000;
 const cookieSeconds = 7 * 24 * 60 * 60;
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 export const pairingError = '配对码无效或已过期，请运行 shared-ssh-terminal pair 获取新配对码。';
+export const lanPairingError = '配对码无效或已过期，请运行 shared-ssh-terminal pair --lan 获取新配对码。';
 
 // Called under the runtime owner lock. Invalid existing key material fails
 // closed so an unreadable or damaged file cannot silently invalidate sessions.
@@ -24,7 +25,7 @@ export async function loadPairingKey(file: string) {
 }
 
 export class Pairing {
-  private readonly codes = new Map<string, number>();
+  private readonly codes = new Map<string, { expiry: number; target?: string }>();
   private attempts = 0;
   private resetAt = 0;
   readonly cookieName: string;
@@ -33,12 +34,12 @@ export class Pairing {
     this.cookieName = 'sst_session_' + runtimeId.slice(0, 32);
   }
 
-  issue() {
+  issue(target?: string) {
     const now = this.now();
-    for (const [id, expiry] of this.codes) if (expiry <= now) this.codes.delete(id);
+    for (const [id, value] of this.codes) if (value.expiry <= now) this.codes.delete(id);
     if (this.codes.size >= 128) return;
     const code = randomBytes(32).toString('base64url');
-    this.codes.set(digest(code), now + codeLifetime);
+    this.codes.set(digest(code), { expiry: now + codeLifetime, target });
     return code;
   }
 
@@ -53,30 +54,36 @@ export class Pairing {
     return true;
   }
 
-  redeem(code: unknown, hostname: string) {
+  redeem(code: unknown, hostname: string, target?: string) {
     if (typeof code !== 'string' || !validCode.test(code)) return;
     const id = digest(code);
-    const expiry = this.codes.get(id);
+    const issued = this.codes.get(id);
     // There is no await between lookup and deletion.
-    if (expiry === undefined || !this.codes.delete(id) || expiry <= this.now()) return;
+    if (!issued || issued.target !== target || !this.codes.delete(id) || issued.expiry <= this.now()) return;
+    const name = this.sessionName(target !== undefined);
     const value = `${Math.floor(this.now() / 1000) + cookieSeconds}.${randomBytes(16).toString('hex')}`;
-    const signature = this.sign(hostname, value).toString('hex');
-    return `${this.cookieName}=${value}.${signature}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${cookieSeconds}`;
+    const signature = this.sign(name, hostname, value).toString('hex');
+    return `${name}=${value}.${signature}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${cookieSeconds}${target ? '; Secure' : ''}`;
   }
 
-  private sign(hostname: string, value: string) {
-    return createHmac('sha256', this.key).update(`${this.cookieName}\n${hostname}\n${value}`).digest();
+  private sessionName(secure: boolean) {
+    return secure ? '__Host-' + this.cookieName : this.cookieName;
   }
 
-  expiresAt(cookie: string | undefined, hostname: string) {
-    const prefix = this.cookieName + '=';
+  private sign(name: string, hostname: string, value: string) {
+    return createHmac('sha256', this.key).update(`${name}\n${hostname}\n${value}`).digest();
+  }
+
+  expiresAt(cookie: string | undefined, hostname: string, secure = false) {
+    const name = this.sessionName(secure);
+    const prefix = name + '=';
     const entries = cookie?.split(';').map(entry => entry.trim()).filter(entry => entry.startsWith(prefix)) ?? [];
     if (entries.length !== 1) return;
     const match = /^(\d{1,12}\.[a-f0-9]{32})\.([a-f0-9]{64})$/.exec(entries[0].slice(prefix.length));
     if (!match) return;
     const [, value, signature] = match;
     const expiry = Number(value.split('.')[0]) * 1000;
-    if (expiry <= this.now() || !timingSafeEqual(this.sign(hostname, value), Buffer.from(signature, 'hex'))) return;
+    if (expiry <= this.now() || !timingSafeEqual(this.sign(name, hostname, value), Buffer.from(signature, 'hex'))) return;
     return expiry;
   }
 }

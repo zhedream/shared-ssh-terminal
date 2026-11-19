@@ -13,7 +13,7 @@ export function preferredLocalPort(value?: string) {
   return port;
 }
 
-function listen(server: Server, port: number) {
+function listen(server: Server, port: number, address: string) {
   return new Promise<void>((resolve, reject) => {
     const onError = (error: unknown) => {
       server.off('error', onError);
@@ -26,17 +26,21 @@ function listen(server: Server, port: number) {
     };
     server.once('error', onError);
     server.once('listening', onListening);
-    try { server.listen(port, LOCAL_ADDRESS); }
+    try { server.listen(port, address); }
     catch (error) { onError(error); }
   });
 }
 
 export async function listenLocal(server: Server, preferredPort: number) {
+  return listenOn(server, preferredPort, LOCAL_ADDRESS);
+}
+
+export async function listenOn(server: Server, preferredPort: number, address: string) {
   try {
-    await listen(server, preferredPort);
+    await listen(server, preferredPort, address);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error;
-    await listen(server, 0);
+    await listen(server, 0, address);
   }
   const bound = server.address();
   if (!bound || typeof bound === 'string') throw new Error('无法获取本机监听地址');

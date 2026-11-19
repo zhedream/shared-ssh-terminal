@@ -27,6 +27,22 @@ $env:SHARED_SSH_DATA_DIR = Join-Path (Get-Location).Path 'data'
 
 MCP 客户端可运行 `shared-ssh-terminal mcp`，源码安装也可用 `node` 加 `dist/mcp.js` 的绝对路径。已有 `Register-MCP.ps1` 配置可沿用该入口。首次工具调用会查找或启动同目录的服务。`status` 输出 `running`、`address`、`port`，运行时另有 `pid`。若无法确认实例身份，命令报错并提示核对目录和服务日志。
 
+## 局域网 HTTPS
+
+默认只在 IPv4 回环提供本机入口。要在同一个后台实例上增加局域网浏览器入口，在启动者的环境中同时设置以下五项。证书和私钥的相对路径按启动调用时的工作目录解析。
+
+| 环境变量 | 值 |
+| --- | --- |
+| `SHARED_SSH_LAN_BIND` | 此机器上具体的私有或链路本地 IPv4 地址，支持 RFC 1918 和 `169.254.0.0/16` |
+| `SHARED_SSH_LAN_PORT` | 首选 HTTPS 端口，取值 1 至 65535，占用时使用系统分配的端口 |
+| `SHARED_SSH_LAN_HOST` | 浏览器实际访问的局域网 IPv4 地址或 DNS 名，不含协议、端口或路径。使用 DNS 时请确保客户端解析到监听机器 |
+| `SHARED_SSH_LAN_CERT` | PEM 证书或证书链。首张证书须有效，SAN 须包含浏览器使用的 IP 或 DNS 名 |
+| `SHARED_SSH_LAN_KEY` | 与首张证书匹配的未加密 PEM 私钥文件，存放在仅授权账户可读的位置 |
+
+已有服务会继续使用启动时的配置。变更监听或证书前，请安排活动 SSH 的保存或交接，再停止并启动目标实例。`status` 报告回环地址和可选的 `lan.address`、`lan.port`、`lan.origin`。`pair --lan` 只为该 HTTPS Origin 签发五分钟有效的一次性配对链接。命令 `pair`、`server --open` 和 `start.cmd` 继续打开或签发回环入口。
+
+局域网浏览器须信任证书并按 `lan.origin` 访问。配对后，Cookie 绑定浏览器主机名和实例，重启后仍可使用有效 Cookie。如果端口发生回退，使用 `status` 公布的新端口访问。只把配对链接交给有权查看及操作这些 SSH 会话的人。管理签发、停止及 MCP 走独立的回环入口。
+
 ## Windows 旧入口隔离验收
 
 在项目根目录打开一个专用 PowerShell，先构建，再设置三个覆盖。`start.cmd` 打开 `127.0.0.1` 的实际端口。脚本自动化验证可在两次启动前加 `$env:SHARED_SSH_NO_BROWSER = '1'`。
@@ -49,13 +65,13 @@ if (-not $first.running -or -not $second.running -or $first.pid -ne $second.pid 
 }
 ```
 
-在隔离浏览器验收时，如需用 `localhost` 打开同一实例，可从该测试目录的 `ui.json` 构造地址，直接交给默认浏览器。
+首个本机主机名配对后，如需用 `localhost` 打开同一实例，签发另一个一次性码。在隔离浏览器中打开以下 `$localhostPage`，将 `$localhostCode` 粘贴到「配对码」并点击「配对」。
 
 ```powershell
-$launch = Get-Content -LiteralPath (Join-Path $env:SHARED_SSH_RUNTIME_DIR 'ui.json') -Raw | ConvertFrom-Json
-$browserTarget = [UriBuilder]::new($launch.url)
-$browserTarget.Host = 'localhost'
-Start-Process $browserTarget.Uri.AbsoluteUri
+$launchText = node dist/cli.js pair
+$launch = [Uri]$launchText
+$localhostPage = 'http://localhost:' + $launch.Port + '/'
+$localhostCode = $launch.Fragment.Substring('#pair='.Length)
 ```
 
 保持上述环境，在验收结束后调用 `stop.cmd`。这会关闭本轮创建的所有测试 SSH。确认实例停止再移除仅用于本轮的临时目录，随后关闭这个 PowerShell。
@@ -76,7 +92,7 @@ if ($resolvedFixture.StartsWith($fixturePrefix, [StringComparison]::OrdinalIgnor
 | 命令 | 覆盖 |
 | --- | --- |
 | npm run build | TypeScript 类型和输出 |
-| npm test | 本机端口和服务发现、并发 CLI／MCP 首连与重连、唯一输入锁、任务权限、私密、历史、凭据、消息和按钮状态 |
+| npm test | 本机与局域网端口、发现、配对、HTTP／WS 权限、并发 CLI／MCP 首连与重连、会话及按钮状态。局域网集成测试使用临时证书、OpenSSL 和具体私有 IPv4 接口 |
 | npm run test:e2e | 本机 OpenSSH/SSH2/ConPTY、密码/密钥/保存密码、真实 Vim、跨页面、多个 MCP 进程、独立消息与标准通知 |
 | node scripts/shell-smoke.mjs | 本机 Bash 原始输入；设置 SST_TEST_ZSH 可加测 Zsh |
 | npm run check:docs | 所有文档索引和相对引用 |

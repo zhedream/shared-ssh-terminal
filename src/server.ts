@@ -1,4 +1,6 @@
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import https from 'node:https';
+import type { Duplex } from 'node:stream';
 import { readFile, mkdir, unlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -12,8 +14,9 @@ import { readSshConfig } from './ssh-config.js';
 import { Agents, type AgentIdentity } from './agents.js';
 import { ensureAskpass, SavedPasswordPty } from './saved-password.js';
 import { Messages, messagePage } from './messages.js';
-import { LOCAL_ADDRESS, listenLocal, localRequestOrigin, writeRuntimeJson } from './local-network.js';
-import { loadPairingKey, Pairing, pairingError } from './pairing.js';
+import { LOCAL_ADDRESS, listenLocal, listenOn, localRequestOrigin, writeRuntimeJson } from './local-network.js';
+import { lanOrigin, lanRequestOrigin, loadLanConfiguration, type LanDiscovery } from './lan-network.js';
+import { lanPairingError, loadPairingKey, Pairing, pairingError } from './pairing.js';
 import { installRoot as ROOT, servicePaths } from './paths.js';
 import { acquireServiceLock, configuredPort, RuntimeError, runtimeErrorMessage, SERVICE_BUSY, SERVICE_NAME } from './service-runtime.js';
 
@@ -23,7 +26,8 @@ const uiVersion = createHash('sha256').update(Buffer.concat(await Promise.all(
 const paths = servicePaths();
 const { data: DATA, runtime: RUNTIME } = paths;
 let serviceLock: Awaited<ReturnType<typeof acquireServiceLock>>;
-let instance: { service: string; runtime: string; pid: number; address: string; port: number } | undefined;
+let instance: { service: string; runtime: string; pid: number; address: string; port: number; lan?: LanDiscovery } | undefined;
+let lanServer: https.Server | undefined;
 class ServiceBusy extends Error {}
 const token = () => randomBytes(32).toString('hex');
 const adminToken = token(), agentToken = token();
@@ -216,15 +220,25 @@ const assets: Record<string, [string, string]> = {
   '/vendor/fit.js': [require.resolve('@xterm/addon-fit'), 'text/javascript']
 };
 
-const server = http.createServer(async (req, res) => {
+function requestOrigin(req: IncomingMessage, secure: boolean, required = false) {
+  return secure ? lanRequestOrigin(req, instance?.lan, required) : localRequestOrigin(req, required);
+}
+
+async function handleBrowser(req: IncomingMessage, res: ServerResponse, secure: boolean) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   try {
-    const origin = localRequestOrigin(req);
+    const origin = requestOrigin(req, secure);
     if (!origin) return json(res, 403, { error: '来源不被允许' });
-    const route = new URL(req.url ?? '/', origin).pathname;
+    if (!instance || shuttingDown) return json(res, 503, { error: '服务未就绪' });
+    const requested = new URL(req.url ?? '/', origin);
+    if (requested.origin !== origin) return json(res, 403, { error: '来源不被允许' });
+    const route = requested.pathname;
+    if (secure && (route === '/agent' || route.startsWith('/agent/') || route === '/api/pair-code' || route === '/api/shutdown')) {
+      return json(res, 404, { error: '接口不存在' });
+    }
     if (route === '/ui-version' && req.method === 'GET') return json(res, 200, { uiVersion });
     if (route === '/agent/instance' && req.method === 'GET') {
       if (!localManagement(req) || !auth(req, agentToken)) return json(res, 401, { error: 'MCP 认证失败' });
@@ -247,28 +261,32 @@ const server = http.createServer(async (req, res) => {
         if (route === '/api/shutdown') {
           json(res, 200, { ok: true }); setTimeout(() => void shutdown(), 50); return;
         }
-        const code = pairing?.issue();
+        const target = requested.searchParams.get('target');
+        if (target !== null && target !== 'lan') return json(res, 400, { error: '配对目标无效' });
+        if (target === 'lan' && !instance?.lan) return json(res, 409, { error: '当前实例未启用局域网 HTTPS。' });
+        const code = pairing?.issue(target === 'lan' ? instance?.lan?.origin : undefined);
         if (!code) return json(res, 429, { error: '未使用的配对码过多，请稍后再试。' });
         return json(res, 200, { code });
       }
-      if (!['GET', 'HEAD'].includes(req.method ?? '') && !localRequestOrigin(req, true)) {
+      if (!['GET', 'HEAD'].includes(req.method ?? '') && !requestOrigin(req, secure, true)) {
         return json(res, 403, { error: '来源不被允许' });
       }
       const hostname = new URL(origin).hostname;
       if (route === '/api/pair' && req.method === 'POST') {
+        const invalid = secure ? lanPairingError : pairingError;
         if (!pairing?.allowAttempt()) {
           res.setHeader('Retry-After', '60');
           return json(res, 429, { error: '配对请求过多，请稍后重试。' });
         }
         let code: unknown;
         try { code = (await body(req, 1024))?.code; }
-        catch { return json(res, 400, { error: pairingError }); }
-        const cookie = pairing.redeem(code, hostname);
-        if (!cookie) return json(res, 400, { error: pairingError });
+        catch { return json(res, 400, { error: invalid }); }
+        const cookie = pairing.redeem(code, hostname, secure ? origin : undefined);
+        if (!cookie) return json(res, 400, { error: invalid });
         res.setHeader('Set-Cookie', cookie);
         return empty(res);
       }
-      if (!pairing?.expiresAt(req.headers.cookie, hostname)) return json(res, 401, { error: '请先配对浏览器。' });
+      if (!pairing?.expiresAt(req.headers.cookie, hostname, secure)) return json(res, 401, { error: '请先配对浏览器。' });
       if (route === '/api/auth' && req.method === 'GET') return empty(res);
       if (route === '/api/state' && req.method === 'GET') return json(res, 200, { profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
       if (route === '/api/ssh-config' && req.method === 'GET') return json(res, 200, await readSshConfig());
@@ -288,16 +306,20 @@ const server = http.createServer(async (req, res) => {
     const content = await readFile(file);
     res.end(route === '/' ? content.toString('utf8').replaceAll('__SST_UI_VERSION__', uiVersion) : content);
   } catch (e: any) { if (!res.headersSent) json(res, 400, { error: e.message ?? '操作失败' }); else res.end(); }
-});
+}
 
+const server = http.createServer((req, res) => void handleBrowser(req, res, false));
 const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
-server.on('upgrade', (req, socket, head) => {
-  const origin = localRequestOrigin(req, true);
-  if (!origin || req.url !== '/terminal') { socket.destroy(); return; }
-  const expiry = pairing?.expiresAt(req.headers.cookie, new URL(origin).hostname);
-  if (!expiry) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return; }
-  wss.handleUpgrade(req, socket, head, ws => attachBrowser(ws, expiry));
-});
+function browserUpgrade(secure: boolean) {
+  return (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+    const origin = requestOrigin(req, secure, true);
+    if (!instance || shuttingDown || !origin || req.url !== '/terminal') { socket.destroy(); return; }
+    const expiry = pairing?.expiresAt(req.headers.cookie, new URL(origin).hostname, secure);
+    if (!expiry) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return; }
+    wss.handleUpgrade(req, socket, head, ws => attachBrowser(ws, expiry));
+  };
+}
+server.on('upgrade', browserUpgrade(false));
 function attachBrowser(ws: WebSocket, expiry: number) {
   const clientId = randomUUID();
   const timeout = setTimeout(() => ws.close(1008, '配对已过期'), Math.max(0, expiry - Date.now()));
@@ -380,6 +402,9 @@ async function main() {
   if (!serviceLock) throw new ServiceBusy();
   let uiPublished = false;
   try {
+    let lanConfiguration;
+    try { lanConfiguration = await loadLanConfiguration(); }
+    catch (error) { throw new RuntimeError((error as Error).message); }
     await mkdir(DATA, { recursive: true, mode: 0o700 });
     try { await profiles.load(); }
     catch { throw new RuntimeError('无法加载本机服务器配置。请检查配置文件格式和目录权限，修复后重试。'); }
@@ -387,13 +412,29 @@ async function main() {
     catch { throw new RuntimeError('无法加载配对签名密钥。请检查运行目录的 pairing-key.json。'); }
     const { address, port } = await listenLocal(server, requestedPort);
     const url = `http://${address}:${port}`;
-    instance = { service: SERVICE_NAME, runtime: serviceLock.id, pid: process.pid, address, port };
+    let lan: LanDiscovery | undefined;
+    if (lanConfiguration) {
+      lanServer = https.createServer(lanConfiguration.tls, (req, res) => void handleBrowser(req, res, true));
+      lanServer.on('upgrade', browserUpgrade(true));
+      try {
+        const bound = await listenOn(lanServer, lanConfiguration.port, lanConfiguration.address);
+        lan = { ...bound, origin: lanOrigin(lanConfiguration.host, bound.port) };
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        throw new RuntimeError(`无法监听局域网 HTTPS${code ? ` (${code})` : ''}。请检查接口地址、端口及系统权限。`);
+      }
+    }
     await writeRuntimeJson(paths.ui, { adminToken });
     uiPublished = true;
-    await writeRuntimeJson(paths.connection, { url, agentToken, pid: process.pid, address, port });
+    await writeRuntimeJson(paths.connection, { url, agentToken, pid: process.pid, address, port, lan });
+    instance = { service: SERVICE_NAME, runtime: serviceLock.id, pid: process.pid, address, port, lan };
     console.log(`共享 SSH 终端已启动 (${address}:${port})`);
+    if (lan) console.log(`局域网浏览器入口 ${lan.origin}。可访问该地址的设备可以尝试连接，请仅在信任的网络启用。`);
   } catch (error) {
     server.close();
+    server.closeAllConnections();
+    lanServer?.close();
+    lanServer?.closeAllConnections();
     if (uiPublished) await unlink(paths.ui).catch(() => {});
     await serviceLock.release().catch(() => {});
     throw error;
@@ -404,7 +445,7 @@ async function shutdown() {
   try { await startup; } catch { return; }
   for (const s of sessions.values()) s.close();
   for (const ws of wss.clients) ws.close(1001, '服务停止');
-  server.close(); wss.close();
+  server.close(); lanServer?.close(); wss.close();
   await Promise.all([paths.connection, paths.ui].map(file => unlink(file).catch(() => {})));
   await serviceLock?.release().catch(() => {});
   setTimeout(() => process.exit(0), 500).unref();

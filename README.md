@@ -28,7 +28,7 @@
 
 Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`。
 
-1. 双击 `start.cmd` 启动或复用本地服务并打开浏览器。默认地址为 `http://127.0.0.1:43127/`，端口被占用时会打开实际分配的地址。
+1. 双击 `start.cmd` 启动或复用本地服务，并通过一次性链接打开浏览器配对。默认地址为 `http://127.0.0.1:43127/`，端口被占用时会打开实际分配的地址。
 2. 添加服务器 Host、端口、用户及密码／私钥路径／系统 SSH Agent 认证方式。
 3. 可从 `%USERPROFILE%\.ssh\config` 快速导入 Host，导入后独立维护。不会修改原配置；连接使用 `-F NUL`，不会隐式叠加其他配置。
 4. 密钥可直接自动登录。密码认证可勾选“保存密码并自动登录”；不勾选时在终端手动输入。私钥口令和 `su - root` 密码仍由用户输入。
@@ -37,6 +37,8 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 配置和运行状态默认放在 `~/.shared-terminal/`。升级时可用环境变量接续旧配置目录，具体步骤见[本机配置与旧目录](docs/development.md#本机配置与旧目录)。
 
 从本地包安装后使用 `shared-ssh-terminal server` 启动或复用服务，`shared-ssh-terminal status` 查看实际地址与端口，`shared-ssh-terminal mcp` 供 MCP 客户端启动 stdio 适配端。在源码目录构建后，可用 `node dist/cli.js` 加同样的子命令。`stop` 会停止当前运行目录的服务并关闭其所有 SSH 会话。
+
+本机浏览器可用 `shared-ssh-terminal pair` 重新获取五分钟有效的一次性链接。要让同一可信局域网中的浏览器访问，配置 HTTPS 监听和证书后运行 `shared-ssh-terminal pair --lan`。各已配对浏览器共享同一服务的 SSH 会话。[局域网 HTTPS 配置](docs/development.md#局域网-https)
 
 两个输入按钮始终同时展示：
 
@@ -68,7 +70,7 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 
 自动登录通过系统 OpenSSH 的 askpass 认证通道提供密码，不通过终端按键输入或解析远端输出；不会把密码变成 Shell 命令、滚动历史或 MCP 返回值。首次连接仍须在终端确认主机指纹；指纹改变时仍由 OpenSSH 拒绝连接。保存的密码被拒绝后，终端显示提示并等待用户手动输入，输入不回显。
 
-首次使用会由 Windows PowerShell 编译本机 askpass 小组件到 `.runtime`，无需下载额外软件。需要支持 `SSH_ASKPASS_REQUIRE=force` 的 Windows OpenSSH（建议 8.6+）。自动保存仅支持标准 SSH 密码认证；仅接受 keyboard-interactive／多因素认证的服务器应使用终端手动输入。
+首次使用由 Windows PowerShell 将 askpass 助手编译到实例运行目录。需要支持 `SSH_ASKPASS_REQUIRE=force` 的 Windows OpenSSH（建议 8.6+）。自动保存仅支持标准 SSH 密码认证。仅接受 keyboard-interactive 或多因素认证的服务器应使用终端手动输入。
 
 ## MCP
 

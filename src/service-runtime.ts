@@ -3,10 +3,12 @@ import { createHash } from 'node:crypto';
 import { mkdir, open, readFile, realpath, unlink } from 'node:fs/promises';
 import { request } from 'node:http';
 import { createConnection, createServer } from 'node:net';
+import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { LOCAL_ADDRESS, preferredLocalPort } from './local-network.js';
+import { lanDiscoverySchema, lanPathEnv } from './lan-network.js';
 import { installRoot, type ServicePaths } from './paths.js';
 
 export const SERVICE_NAME = 'shared-ssh-terminal';
@@ -18,6 +20,7 @@ const bearerSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const connectionSchema = z.object({
   url: z.string(), agentToken: bearerSchema, pid: pidSchema,
   address: z.literal(LOCAL_ADDRESS), port: z.number().int().min(1024).max(65535),
+  lan: lanDiscoverySchema.optional(),
 }).refine(c => c.url === `http://${c.address}:${c.port}`);
 export type ServiceConnection = z.infer<typeof connectionSchema>;
 
@@ -164,8 +167,12 @@ export async function findService(paths: ServicePaths, signal?: AbortSignal): Pr
     const response = await loopbackRequest(connection, '/agent/instance', connection.agentToken, 'GET',
       signal ? AbortSignal.any([signal, timeout]) : timeout);
     if (response.status !== 200) return;
-    const { service, runtime, pid, address, port } = JSON.parse(response.body);
-    if (service === SERVICE_NAME && runtime === id && pid === connection.pid && address === connection.address && port === connection.port) {
+    const { service, runtime, pid, address, port, lan } = JSON.parse(response.body);
+    const expectedLan = connection.lan;
+    const lanMatches = expectedLan
+      ? lan?.address === expectedLan.address && lan?.port === expectedLan.port && lan?.origin === expectedLan.origin
+      : lan === undefined;
+    if (service === SERVICE_NAME && runtime === id && pid === connection.pid && address === connection.address && port === connection.port && lanMatches) {
       return connection;
     }
   } catch { signal?.throwIfAborted(); }
@@ -173,7 +180,7 @@ export async function findService(paths: ServicePaths, signal?: AbortSignal): Pr
 
 export async function serviceStatus(paths: ServicePaths) {
   const service = await findService(paths);
-  if (service) return { running: true as const, address: service.address, port: service.port, pid: service.pid };
+  if (service) return { running: true as const, address: service.address, port: service.port, pid: service.pid, lan: service.lan };
   if (await lockIsHeld(paths) || await ownerIsLive(paths)) {
     throw new RuntimeError('本地服务未就绪或身份无法确认。请稍后重试，并检查运行目录的 service.stderr.log。');
   }
@@ -190,9 +197,13 @@ async function launchService(paths: ServicePaths): Promise<Launch> {
       const fromSource = fileURLToPath(import.meta.url).endsWith('.ts');
       const args = fromSource ? ['--import', 'tsx', 'src/server.ts'] : ['dist/server.js'];
       const launch: Launch = { finished: false };
+      const env = { ...process.env, SHARED_SSH_DATA_DIR: paths.data, SHARED_SSH_RUNTIME_DIR: paths.runtime };
+      for (const key of lanPathEnv) {
+        if (process.env[key]) Object.assign(env, { [key]: path.resolve(process.env[key]) });
+      }
       const child = spawn(process.execPath, args, {
         cwd: installRoot, detached: true, windowsHide: true, stdio: ['ignore', stdout.fd, stderr.fd],
-        env: { ...process.env, SHARED_SSH_DATA_DIR: paths.data, SHARED_SSH_RUNTIME_DIR: paths.runtime },
+        env,
       });
       child.once('error', () => { launch.finished = true; });
       child.once('exit', code => { launch.code = code; launch.finished = true; });
@@ -227,16 +238,19 @@ async function managementToken(paths: ServicePaths) {
   return result.data.adminToken;
 }
 
-export async function pairingUrl(paths: ServicePaths, connection: ServiceConnection) {
+export async function pairingUrl(paths: ServicePaths, connection: ServiceConnection, lan = false) {
+  const origin = lan ? connection.lan?.origin : connection.url;
+  if (!origin) throw new RuntimeError('此实例未启用局域网 HTTPS。请配置后重新启动该实例。');
   const token = await managementToken(paths);
-  const response = await loopbackRequest(connection, '/api/pair-code', token, 'POST', AbortSignal.timeout(3000));
+  const route = lan ? '/api/pair-code?target=lan' : '/api/pair-code';
+  const response = await loopbackRequest(connection, route, token, 'POST', AbortSignal.timeout(3000));
   if (response.status !== 200) {
     if (response.status === 429) throw new RuntimeError('未使用的配对码过多，请稍后再试。');
     throw new RuntimeError('本机服务拒绝签发配对码。请核对运行目录和服务版本。');
   }
   const result = z.object({ code: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).safeParse(JSON.parse(response.body));
   if (!result.success) throw new RuntimeError('本机服务返回的配对信息无效。');
-  return `${connection.url}/#pair=${result.data.code}`;
+  return `${origin}/#pair=${result.data.code}`;
 }
 
 export async function stopService(paths: ServicePaths) {
