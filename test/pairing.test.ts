@@ -12,6 +12,7 @@ import { Pairing } from '../src/pairing.js';
 import { installRoot, servicePaths } from '../src/paths.js';
 
 const run = promisify(execFile);
+const localAddress = '127.0.0.1';
 
 test('pairing codes and signed cookies expire at their deadlines', () => {
   let now = 1_800_000_000_000;
@@ -36,17 +37,28 @@ test('pairing codes and signed cookies expire at their deadlines', () => {
   assert(pairing.allowAttempt());
 });
 
-async function fixture(t: TestContext) {
+async function reservePort(t: TestContext, port = 0) {
+  const reserved = createServer();
+  reserved.listen(port, localAddress);
+  await once(reserved, 'listening');
+  t.after(() => new Promise<void>(resolve => reserved.close(() => resolve())));
+  const address = reserved.address();
+  assert(address && typeof address !== 'string');
+  return address.port;
+}
+
+async function fixture(t: TestContext, reservedPort: number) {
   const prefix = path.resolve(tmpdir(), 'sst-pairing-');
   const directory = await mkdtemp(prefix);
-  const env = {
-    ...process.env, SHARED_SSH_PORT: '43128',
+  const env: NodeJS.ProcessEnv = {
+    ...process.env, SHARED_SSH_PORT: String(reservedPort),
     SHARED_SSH_DATA_DIR: path.join(directory, 'data'),
     SHARED_SSH_RUNTIME_DIR: path.join(directory, 'runtime'),
   };
+  for (const key of Object.keys(env)) if (key.startsWith('SHARED_SSH_LAN_')) delete env[key];
   const paths = servicePaths(env);
-  const cli = (command: string) => run(process.execPath, ['--import', 'tsx', 'src/cli.ts', command], {
-    cwd: installRoot, env, windowsHide: true, timeout: 16000,
+  const cli = (command: string, preferredPort = reservedPort) => run(process.execPath, ['--import', 'tsx', 'src/cli.ts', command], {
+    cwd: installRoot, env: { ...env, SHARED_SSH_PORT: String(preferredPort) }, windowsHide: true, timeout: 16000,
   });
   t.after(async () => {
     await cli('stop');
@@ -65,10 +77,12 @@ function redeem(origin: string, body: string, expectedOrigin = origin) {
 }
 
 test('CLI pairing, concurrent redemption, management isolation and cookie reuse after restart', { timeout: 40000 }, async t => {
-  const a = await fixture(t);
-  const b = await fixture(t);
+  const reserved = await reservePort(t);
+  const a = await fixture(t, reserved);
+  const b = await fixture(t, reserved);
   const link = new URL((await a.cli('pair')).stdout.trim());
-  assert.equal(link.hostname, '127.0.0.1');
+  assert.equal(link.hostname, localAddress);
+  assert.notEqual(Number(link.port), reserved);
   assert(/^#pair=[A-Za-z0-9_-]{43}$/.test(link.hash));
   const origin = link.origin;
   const code = link.hash.slice('#pair='.length);
@@ -111,12 +125,8 @@ test('CLI pairing, concurrent redemption, management isolation and cookie reuse 
   assert.equal((await check(other.origin, cookie + '; ' + secondCookie)).status, 204);
 
   await a.cli('stop');
-  const reserved = createServer();
-  reserved.listen(Number(link.port), link.hostname);
-  await once(reserved, 'listening');
-  let restarted;
-  try { restarted = JSON.parse((await a.cli('server')).stdout); }
-  finally { await new Promise<void>(resolve => reserved.close(() => resolve())); }
+  const oldPort = await reservePort(t, Number(link.port));
+  const restarted = JSON.parse((await a.cli('server', oldPort)).stdout);
   assert.notEqual(String(restarted.port), link.port);
   const restartedOrigin = `http://${restarted.address}:${restarted.port}`;
   assert.equal((await check(restartedOrigin, cookie)).status, 204);

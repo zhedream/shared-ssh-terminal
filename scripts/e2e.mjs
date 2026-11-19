@@ -18,7 +18,7 @@ import headless from '@xterm/headless';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const tempPrefix = path.resolve(tmpdir(), 'sst-e2e-');
 const temporary = await mkdtemp(tempPrefix);
-const env = { ...process.env, SHARED_SSH_PORT: '43128', SHARED_SSH_DATA_DIR: path.join(temporary, 'profile data'), SHARED_SSH_RUNTIME_DIR: path.join(temporary, 'runtime files') };
+const env = { ...process.env, SHARED_SSH_DATA_DIR: path.join(temporary, 'profile data'), SHARED_SSH_RUNTIME_DIR: path.join(temporary, 'runtime files') };
 for (const key of Object.keys(env)) if (key.startsWith('SHARED_SSH_LAN_')) delete env[key];
 const execCliFile = promisify(execFile);
 const runCli = command => execCliFile(process.execPath, ['dist/cli.js', command], { cwd: root, env, windowsHide: true, timeout: 15000 });
@@ -64,6 +64,7 @@ const ssh = new ssh2.Server({ hostKeys: [key.privateKey] }, client => {
 });
 await new Promise(resolve => ssh.listen(0, '127.0.0.1', resolve));
 const sshPort = ssh.address().port;
+env.SHARED_SSH_PORT = String(sshPort);
 let service, ws, client, transport, clientB, transportB, browserTwo;
 let stderr = '', output = '', ready = false, ui, agent, clientId, browserInstanceId;
 const states = new Map(), pending = new Map(), perSessionOutput = new Map();
@@ -72,11 +73,11 @@ async function until(predicate, label, timeout = 15000) {
   const start = Date.now();
   while (!await predicate()) { if (Date.now() - start > timeout) throw new Error(`Timeout: ${label}. ${stderr}\nTerminal: ${output.slice(-1800)}`); await new Promise(r => setTimeout(r, 50)); }
 }
-function request(type, args = {}) {
+function request(type, args = {}, onAck) {
   const requestId = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('WS timeout ' + type)); }, 10000);
-    pending.set(requestId, { resolve, reject, timer }); ws.send(JSON.stringify({ type, requestId, ...args }));
+    pending.set(requestId, { resolve, reject, timer, onAck }); ws.send(JSON.stringify({ type, requestId, ...args }));
   });
 }
 async function input(id, data) { return request('input', { sessionId: id, data, revision: states.get(id).revision }); }
@@ -121,6 +122,7 @@ try {
   ui = JSON.parse(await readFile(path.join(env.SHARED_SSH_RUNTIME_DIR, 'ui.json'), 'utf8'));
   agent = JSON.parse(await readFile(path.join(env.SHARED_SSH_RUNTIME_DIR, 'connection.json'), 'utf8'));
   assert.equal(agent.address, '127.0.0.1');
+  assert.notEqual(agent.port, sshPort, 'The active loopback SSH fixture holds the preferred port');
   assert.equal(agent.url, `http://${agent.address}:${agent.port}`);
   const issued = await fetch(agent.url + '/api/pair-code', { method: 'POST', headers: { Authorization: `Bearer ${ui.adminToken}` } });
   assert.equal(issued.status, 200);
@@ -150,7 +152,10 @@ try {
     if (p.type === 'ack' || p.type === 'error') {
       const item = pending.get(p.requestId); if (!item) return;
       clearTimeout(item.timer); pending.delete(p.requestId);
-      p.type === 'ack' ? item.resolve(p.result) : item.reject(new Error(p.error));
+      try {
+        if (p.type === 'ack') item.resolve(item.onAck ? item.onAck(p.result) : p.result);
+        else item.reject(new Error(p.error));
+      } catch (error) { item.reject(error); }
     }
   });
   await until(() => ready, 'UI WebSocket ready');
@@ -176,6 +181,28 @@ try {
   if (/continue connecting/i.test(output)) await input(id, 'yes\r');
   await until(() => /password:/i.test(output), 'password prompt'); await input(id, 'local-test-password\r');
   await until(() => output.includes('test-shell>'), 'password login');
+  // Observe actual keystrokes with a blocking read while the terminal redraws.
+  await input(id, 'printf "RESIZE-READ-%s\\n" ready; IFS= read -r key; printf "RESIZE-ACK-%s\\n" "$key"\r');
+  await until(() => perSessionOutput.get(id)?.includes('RESIZE-READ-ready'), 'fixture reads input across resize');
+  const beforeResize = states.get(id);
+  const resizeKeys = 'immediate';
+  let resizeFrame;
+  const trackResize = raw => {
+    const frame = JSON.parse(raw.toString());
+    if (frame.type === 'resize' && frame.sessionId === id) resizeFrame = frame;
+  };
+  ws.on('message', trackResize);
+  try {
+    await request('resize', { sessionId: id, cols: 112, rows: 34 }, () => {
+      assert(resizeFrame && resizeFrame.uiSeq > beforeResize.sequence, 'Resize frame must precede the ack');
+      const current = states.get(id);
+      assert.deepEqual([resizeFrame.cols, resizeFrame.rows, current.cols, current.rows], [112, 34, 112, 34]);
+      assert.equal(current.revision, beforeResize.revision + 1, 'New revision must precede the resize ack');
+      return input(id, `${resizeKeys}\r`);
+    });
+  } finally { ws.off('message', trackResize); }
+  await assert.rejects(request('input', { sessionId: id, revision: beforeResize.revision, data: 'stale\r' }), /终端状态已变化/);
+  await until(() => perSessionOutput.get(id)?.includes('RESIZE-ACK-immediate'), 'input sent from the resize ack');
   assert((await readFile(path.join(env.SHARED_SSH_DATA_DIR, 'known_hosts'), 'utf8')).includes('ssh-rsa'));
   // Saved credentials use OpenSSH askpass, never terminal typing. A different
   // hostname exercises first-use fingerprint confirmation on the same test SSH.
@@ -474,7 +501,7 @@ try {
   assert.notEqual(freshLease, oldLease);
   assert.match((await call('send_input', { sessionId: fresh.id, lease: oldLease, data: 'no replay\r' }, true)).content[0].text, /锁已失效/);
   assert.match((await call('read_history', { sessionId: fresh.id, cursor: oldCursor }, true)).content[0].text, /分页游标/);
-  console.log('PASS: password/key SSH, real Vim, explicit locks, privacy, messages, same-instance browser reconnect, and restart with a new SSH only after an explicit request.');
+  console.log('PASS: password/key SSH, resize ack before immediate input, real Vim, explicit locks, privacy, messages, browser reconnect, and restart with a new SSH only after an explicit request.');
 
 } finally {
   for (const item of pending.values()) clearTimeout(item.timer);

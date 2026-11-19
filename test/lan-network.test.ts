@@ -7,7 +7,7 @@ import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { networkInterfaces, tmpdir } from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { type TestContext } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { WebSocket } from 'ws';
@@ -17,6 +17,36 @@ import { installRoot, servicePaths } from '../src/paths.js';
 const run = promisify(execFile);
 const tsx = pathToFileURL(createRequire(import.meta.url).resolve('tsx')).href;
 const names = ['BIND', 'PORT', 'HOST', 'CERT', 'KEY'].map(key => 'SHARED_SSH_LAN_' + key);
+
+async function reservePort(t: TestContext, address: string) {
+  const server = createServer();
+  server.listen(0, address);
+  await once(server, 'listening');
+  t.after(() => new Promise<void>(resolve => server.close(() => resolve())));
+  const bound = server.address();
+  assert(bound && typeof bound !== 'string');
+  return bound.port;
+}
+
+async function fixture(t: TestContext) {
+  const localPort = await reservePort(t, '127.0.0.1');
+  const prefix = path.resolve(tmpdir(), 'sst-lan-');
+  const directory = await mkdtemp(prefix);
+  const env: NodeJS.ProcessEnv = { ...process.env, SHARED_SSH_PORT: String(localPort),
+    SHARED_SSH_DATA_DIR: path.join(directory, 'data'), SHARED_SSH_RUNTIME_DIR: path.join(directory, 'runtime') };
+  for (const key of Object.keys(env)) if (key.startsWith('SHARED_SSH_LAN_')) delete env[key];
+  const paths = servicePaths(env);
+  const invoke = (env: NodeJS.ProcessEnv, ...args: string[]) => run(process.execPath,
+    ['--import', tsx, path.join(installRoot, 'src/cli.ts'), ...args], { cwd: directory, env, windowsHide: true, timeout: 16000 });
+  const cli = (...args: string[]) => invoke(env, ...args);
+  t.after(async () => {
+    await cli('stop');
+    const resolved = path.resolve(directory);
+    assert(resolved.startsWith(prefix) && path.dirname(resolved) === path.dirname(prefix));
+    await rm(resolved, { recursive: true, force: true, maxRetries: 3 });
+  });
+  return { directory, env, paths, cli, invoke, localPort };
+}
 
 test('LAN is opt-in and rejects incomplete, ambiguous and wildcard configuration', async () => {
   assert.equal(await loadLanConfiguration({}), undefined);
@@ -29,26 +59,29 @@ test('LAN is opt-in and rejects incomplete, ambiguous and wildcard configuration
   await assert.rejects(loadLanConfiguration({ ...env, SHARED_SSH_LAN_PORT: '0' }), /1 到 65535/);
 });
 
-test('two listeners share browser state and keep LAN pairing, TLS and administration separate', { timeout: 50000 }, async t => {
+test('Linux refuses LAN configuration before publishing a ready instance', {
+  skip: process.platform !== 'linux', timeout: 25000,
+}, async t => {
+  const { env, paths, cli, localPort } = await fixture(t);
+  Object.assign(env, { SHARED_SSH_LAN_BIND: '192.0.2.1', SHARED_SSH_LAN_PORT: String(localPort),
+    SHARED_SSH_LAN_HOST: 'terminal.test', SHARED_SSH_LAN_CERT: 'missing-cert.pem', SHARED_SSH_LAN_KEY: 'missing-key.pem' });
+  await assert.rejects(cli('server'), /本地服务启动失败/);
+  assert.match(await readFile(paths.stderr, 'utf8'), /Linux 目前只支持本机回环/);
+  assert.equal(JSON.parse((await cli('status')).stdout).running, false);
+  for (const file of [paths.connection, paths.ui, paths.owner]) await assert.rejects(access(file), { code: 'ENOENT' });
+});
+
+test('Windows listeners share browser state and keep LAN pairing, TLS and administration separate', {
+  skip: process.platform !== 'win32', timeout: 50000,
+}, async t => {
   const interfaces = Object.values(networkInterfaces()).flatMap(value => value ?? []);
   const address = interfaces.find(item => item.family === 'IPv4' && !item.internal &&
     /^(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.)/.test(item.address))?.address;
   if (!address) { t.skip('No private IPv4 interface for the isolated TLS test'); return; }
-  const prefix = path.resolve(tmpdir(), 'sst-lan-');
-  const directory = await mkdtemp(prefix);
-  const env = { ...process.env, SHARED_SSH_DATA_DIR: path.join(directory, 'data'), SHARED_SSH_RUNTIME_DIR: path.join(directory, 'runtime'),
-    SHARED_SSH_PORT: '43128', SHARED_SSH_LAN_BIND: address, SHARED_SSH_LAN_HOST: address,
-    SHARED_SSH_LAN_PORT: '443', SHARED_SSH_LAN_CERT: 'cert.pem', SHARED_SSH_LAN_KEY: 'key.pem' };
-  const paths = servicePaths(env);
-  const invoke = (env: NodeJS.ProcessEnv, ...args: string[]) => run(process.execPath,
-    ['--import', tsx, path.join(installRoot, 'src/cli.ts'), ...args], { cwd: directory, env, windowsHide: true, timeout: 16000 });
-  const cli = (...args: string[]) => invoke(env, ...args);
-  t.after(async () => {
-    await cli('stop');
-    const resolved = path.resolve(directory);
-    assert(resolved.startsWith(prefix) && path.dirname(resolved) === path.dirname(prefix));
-    await rm(resolved, { recursive: true, force: true, maxRetries: 3 });
-  });
+  const { directory, env, paths, cli, invoke, localPort } = await fixture(t);
+  const blockedLanPort = await reservePort(t, address);
+  Object.assign(env, { SHARED_SSH_LAN_BIND: address, SHARED_SSH_LAN_HOST: address,
+    SHARED_SSH_LAN_PORT: String(blockedLanPort), SHARED_SSH_LAN_CERT: 'cert.pem', SHARED_SSH_LAN_KEY: 'key.pem' });
   const gitOpenSsl = path.join(process.env.ProgramFiles ?? 'C:/Program Files', 'Git/usr/bin/openssl.exe');
   const openssl = process.platform === 'win32' && await access(gitOpenSsl).then(() => true, () => false) ? gitOpenSsl : 'openssl';
   try {
@@ -68,17 +101,11 @@ test('two listeners share browser state and keep LAN pairing, TLS and administra
   await assert.rejects(access(paths.connection), { code: 'ENOENT' });
   await assert.rejects(access(paths.ui), { code: 'ENOENT' });
 
-  const reserved = createServer();
-  reserved.listen(0, address);
-  await once(reserved, 'listening');
-  t.after(() => new Promise<void>(resolve => reserved.close(() => resolve())));
-  const blocked = reserved.address();
-  assert(blocked && typeof blocked !== 'string');
-  env.SHARED_SSH_LAN_PORT = String(blocked.port);
   const first = JSON.parse((await cli('server')).stdout) as { address: string; port: number; lan: LanDiscovery };
   assert.equal(first.address, '127.0.0.1');
+  assert.notEqual(first.port, localPort);
   assert.equal(first.lan.address === address, true);
-  assert.notEqual(first.lan.port, blocked.port);
+  assert.notEqual(first.lan.port, blockedLanPort);
   assert.deepEqual(JSON.parse((await cli('status')).stdout).lan, first.lan);
   const local = `http://127.0.0.1:${first.port}`;
   const ca = await readFile(path.join(directory, 'cert.pem'));

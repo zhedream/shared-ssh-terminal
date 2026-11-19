@@ -245,13 +245,14 @@ export class Session extends EventEmitter {
     await this.renderQueue; this.changed();
   }
   resize(cols: number, rows: number) {
-    this.ensureOpen(); this.cols = cols; this.rows = rows; this.pty.resize(cols, rows);
+    this.ensureOpen(); this.pty.resize(cols, rows);
     const seq = ++this.sequence;
     this.renderQueue = this.renderQueue.then(() => {
-      this.terminal.resize(cols, rows); this.renderedSequence = seq;
+      this.terminal.resize(cols, rows); this.cols = cols; this.rows = rows; this.renderedSequence = seq;
       this.trackTrimming(); this.normalHistoryRevision++;
       this.emit('resize', { cols, rows, seq, uiSeq: seq }); this.emit('public-output', seq); this.changed();
     });
+    return this.renderQueue;
   }
   close() { if (this.status === 'open' && !this.closing) { this.closing = true; this.pty.kill(); } }
 }

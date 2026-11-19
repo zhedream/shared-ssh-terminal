@@ -17,7 +17,10 @@ function matches(alias: string, patterns: string[]) {
   return patterns.some(p => !p.startsWith('!') && match(p)) && !patterns.some(p => p.startsWith('!') && match(p.slice(1)));
 }
 function expandHome(file: string, home: string) {
-  return file === '~' ? home : /^~[/\\]/.test(file) ? path.join(home, file.slice(2)) : file;
+  if (file === '~') return home;
+  const homePath = path.win32.isAbsolute(home) && !path.posix.isAbsolute(home) ? path.win32 : path.posix;
+  if (file.startsWith('~/') || (homePath === path.win32 && file.startsWith('~\\'))) return homePath.join(home, file.slice(2));
+  return file;
 }
 export function parseConfig(text: string, home = homedir()) {
   const sections: { patterns: string[]; values: Map<string, string[]>; conditional: boolean }[] = [];

@@ -21,10 +21,16 @@ const nodeArgs = ['--import', 'tsx', 'src/cli.ts'];
 async function fixture(t: TestContext, stop = true) {
   const prefix = path.resolve(tmpdir(), 'sst-service-test-');
   const directory = await mkdtemp(prefix);
+  const reserved = createServer();
+  reserved.listen(0, '127.0.0.1');
+  await once(reserved, 'listening');
+  t.after(() => new Promise<void>(resolve => reserved.close(() => resolve())));
+  const address = reserved.address();
+  assert(address && typeof address !== 'string');
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     SHARED_SSH_DATA_DIR: path.join(directory, 'data'), SHARED_SSH_RUNTIME_DIR: path.join(directory, 'runtime'),
-    SHARED_SSH_PORT: '43128',
+    SHARED_SSH_PORT: String(address.port),
   };
   for (const key of Object.keys(env)) if (key.startsWith('SHARED_SSH_LAN_')) delete env[key];
   const paths = servicePaths(env);
@@ -89,6 +95,7 @@ test('simultaneous CLI and MCP first calls converge, and the same adapters recon
   const started = await Promise.all([f.cli('server'), f.cli('server'), whoami(a.client), whoami(b.client), whoami(c.client)]);
   const first = JSON.parse(started[0].stdout);
   assert.deepEqual(JSON.parse(started[1].stdout), first);
+  assert.notEqual(first.port, Number(f.env.SHARED_SSH_PORT));
   assert.equal(new Set(started.slice(2)).size, 3);
   assert.deepEqual(JSON.parse((await f.cli('status')).stdout), first);
 

@@ -377,7 +377,7 @@ function attachBrowser(ws: WebSocket, expiry: number) {
           }
           else if (p.type === 'clear-messages') { messages.clear(s.id); broadcast({ type: 'messages', sessionId: s.id, messages: [] }); }
           else if (p.type === 'clear-history') { await s.clearHistory(); messages.clear(s.id); broadcast({ type: 'messages', sessionId: s.id, messages: [] }); }
-          else if (p.type === 'resize') s.resize(z.number().int().min(20).max(400).parse(p.cols), z.number().int().min(5).max(160).parse(p.rows));
+          else if (p.type === 'resize') await s.resize(z.number().int().min(20).max(400).parse(p.cols), z.number().int().min(5).max(160).parse(p.rows));
           else if (p.type === 'close') s.close();
           else throw new Error('未知终端操作');
         }

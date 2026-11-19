@@ -109,6 +109,40 @@ test('user partial input is observed from the same terminal while another page c
   s.releaseAgent(next.lease, agentA); s.close();
 });
 
+test('resize completion publishes the new screen and revision before immediate browser input', async t => {
+  const { s, pty } = fixture();
+  const started = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const write = s.terminal.write.bind(s.terminal);
+  t.mock.method(s.terminal, 'write', (...args: Parameters<typeof write>) => {
+    started.resolve();
+    void resume.promise.then(() => write(...args));
+  });
+  const events: string[] = [];
+  let publishedRevision: number | undefined;
+  s.on('output', () => events.push('output'));
+  s.on('resize', ({ cols, rows, uiSeq }) => {
+    assert.deepEqual([s.terminal.cols, s.terminal.rows, cols, rows, uiSeq], [112, 34, 112, 34, 2]);
+    events.push('resize');
+  });
+  s.once('state', state => { publishedRevision = state.revision; events.push('state'); });
+  pty.emit('data', 'earlier output');
+  await started.promise;
+  const previousRevision = s.revision;
+  const nextInput = Promise.resolve(s.resize(112, 34)).then(() => {
+    assert.deepEqual(events, ['output', 'resize', 'state']);
+    assert.equal(publishedRevision, previousRevision + 1);
+    assert.throws(() => s.userInput('browser', 'stale', previousRevision), /状态已变化/);
+    assert.throws(() => s.userInput('other-page', 'bad owner', publishedRevision!), /另一方/);
+    s.userInput('browser', 'immediate', publishedRevision!);
+  });
+  resume.resolve();
+  await nextInput;
+  assert.deepEqual(pty.writes, ['immediate']);
+  assert.equal((await s.snapshot()).sequence, 2);
+  s.close();
+});
+
 test('manual handoff protects an idle or user-owned terminal until explicit return', () => {
   const { s, pty } = fixture(agentA);
   const first = s.acceptControl(agentA);
