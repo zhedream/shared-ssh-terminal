@@ -19,7 +19,13 @@
 | Agent 显式交接 | 用有效 lease 调用 `handoff_to_user`。旧 lease 失效，当前页签显示「已交给用户」。用户处理指纹、登录、二次验证或其他人工步骤。打字、超时、刷新和掉线保留交接保护。 |
 | 用户明确交回 | 在该页签点击「交回 Agent」，或由当前持锁页面点击「释放输入权」。Agent 再调用 `take_control` 获得新 lease。另一页不能代当前持锁页面交回。 |
 
-Agent 取锁遇到 `handed_to_user` 时，可用 `list_sessions` 查询交接、在授权范围内读屏，并用 `request_control_return` 更新「Agent 请求交回」说明。用户可通过「发消息给 Agent」单独留言。Agent 读取实际收到的留言并用 `acknowledge_messages` 确认。 「解除关联」会撤销该 Agent 的访问。
+Agent 取锁遇到 `handed_to_user` 时，可用 `list_sessions` 查询交接、在授权范围内读屏，并用 `request_control_return` 更新「Agent 请求交回」说明。用户可通过「发消息给 Agent」单独留言。Agent 读取实际收到的留言并用 `acknowledge_messages` 确认。
+
+## 解除关联
+
+在「已连接的会话 → 工具栏 → 解除关联」点击后，原 Agent 的会话访问权被撤销，当前页面接管输入权，原 SSH 程序继续运行。「Agent 请求交回」说明随关联清除，独立留言历史及其原接收者仍保留。
+
+如果会话已有「已交给用户」状态，解除关联后交接保护继续生效。要结束交接保护，可重新关联后点击「交回 Agent」，或由当前持锁页面主动点击「释放输入权」。
 
 ## 私密操作
 
