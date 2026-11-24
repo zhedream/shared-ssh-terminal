@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -9,6 +10,35 @@ import { WindowsSecrets } from '../src/secrets.js';
 import { hostKeyOptions, resolveLinuxSsh, sshPlatform } from '../src/ssh-platform.js';
 
 const config = { name: 'saved-login', host: '127.0.0.1', port: 2222, username: 'test-user', auth: 'password', savePassword: true };
+
+test('SSH command preserves literal startup directories and falls back to the login directory', async t => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'sst ssh cwd '));
+  const name = "-fixture's spaced directory";
+  const shell = process.platform === 'win32' ? path.join(process.env.ProgramFiles ?? 'C:/Program Files', 'Git/bin/bash.exe') : '/bin/sh';
+  try {
+    await mkdir(path.join(directory, name));
+    const profiles = new Profiles(directory, null);
+    const saved = await profiles.save({ ...config, savePassword: false, startupDir: name });
+    const reloaded = new Profiles(directory, null);
+    await reloaded.load();
+    assert.equal(reloaded.get(saved.id).startupDir, name);
+    await assert.rejects(reloaded.save({ ...saved, startupDir: 'first\nsecond' }));
+    assert.deepEqual(sshArgs({ ...saved, startupDir: undefined }).slice(-2), ['--', saved.host]);
+    const runDirectory = (startupDir: string) => spawnSync(shell, ['-c', sshArgs({ ...saved, startupDir }).at(-1)!], {
+      cwd: directory, encoding: 'utf8', windowsHide: true, timeout: 10000,
+      env: { ...process.env, SHELL: '/bin/sh', HOME: directory, CHERE_INVOKING: '1' },
+      input: 'printf "%s\\n" "${PWD##*/}"; exit\n',
+    });
+    const result = runDirectory(name);
+    if ((result.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') { t.skip('POSIX fixture shell unavailable'); return; }
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), name);
+    const missing = runDirectory('isolated absent directory');
+    assert.equal(missing.status, 0, missing.stderr);
+    assert.equal(missing.stdout.trim(), path.basename(directory));
+    assert.match(missing.stderr, /启动目录不可用/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
 test('saved passwords are encrypted, never returned, retained on edit, and removed when disabled or deleted', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'sst-profiles-'));
   const secrets = { protect: async (v: string) => 'protected:' + Buffer.from(v).toString('base64'), unprotect: async (v: string) => Buffer.from(v.slice(10), 'base64').toString() };

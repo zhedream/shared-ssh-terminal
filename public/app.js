@@ -29,8 +29,13 @@ function saveDismissedTabs() { try { localStorage.setItem(dismissedStorageKey, J
 let profiles = [], activeId = null, socket, clientId, ready = false, reconnectTimer, toastTimer;
 let pairing = false, checkingAuth = false;
 let canSavePassword = true;
+let canUseLocalTerminal = false, runConfigs = [], runConfigsRevision = 0;
+let pendingLocalActivation;
+const localActionsPending = new Set();
+const localStateLabels = { starting: '启动中', running: '运行中', stopping: '停止中', exited: '已退出', stopped: '已停止' };
 let confirmedInstanceId;
 let confirmedOpenSessions = new Set();
+let confirmedLocalSessions = new Set();
 let addressAdviceTimer;
 function toast(message) { $('toast').textContent = message; $('toast').classList.remove('hidden'); clearTimeout(toastTimer); toastTimer = setTimeout(() => $('toast').classList.add('hidden'), 6500); }
 async function api(route, options = {}) {
@@ -46,11 +51,11 @@ async function api(route, options = {}) {
   }
   const data = await response.json(); if (!response.ok) throw new Error(data.error); return data;
 }
-function request(type, args = {}) {
+function request(type, args = {}, timeout = 10000) {
   if (!ready || socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('本地服务尚未连接'));
   const requestId = crypto.randomUUID();
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('操作响应超时；请查看终端状态，勿重复提交命令')); }, 10000);
+    const timer = setTimeout(() => { pending.delete(requestId); reject(new Error('操作响应超时；请查看终端状态，勿重复提交命令')); }, timeout);
     pending.set(requestId, { resolve, reject, timer }); socket.send(JSON.stringify({ type, requestId, ...args }));
   });
 }
@@ -82,7 +87,7 @@ async function checkUiVersion() {
 }
 setInterval(checkUiVersion, 15000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) void checkUiVersion(); });
-function canInput(s) { return ready && s.status === 'open' && (!s.lock || (s.lock.kind === 'user' && s.lock.owner === clientId)); }
+function canInput(s) { return ready && s.status === 'open' && (s.kind !== 'local' || s.processState === 'running') && (!s.lock || (s.lock.kind === 'user' && s.lock.owner === clientId)); }
 function element(tag, className, text) { const el = document.createElement(tag); if (className) el.className = className; if (text !== undefined) el.textContent = text; return el; }
 function actorLabel(actor) {
   if (!actor) return '用户 / 待交接';
@@ -100,20 +105,28 @@ function renderProfiles() {
     if (p.note) card.append(element('div', 'profile-note', p.note));
     const connect = element('button', 'profile-connect', p.auth === 'key' ? '私钥连接' : p.auth === 'agent' ? 'Agent / 默认密钥' : p.savePassword ? '密码自动登录' : '密码连接');
     connect.disabled = !ready; connect.append(element('span', '', '连接 ↗'));
-    connect.addEventListener('click', () => request('create', { profileId: p.id }).then(s => { updateSession(s); activate(s.id); }).catch(e => toast(e.message)));
-    card.append(connect); root.append(card);
+    connect.addEventListener('click', () => connectSsh(p.id).catch(e => toast(e.message)));
+    const options = element('button', 'profile-options', '连接选项');
+    options.disabled = !ready;
+    options.addEventListener('click', () => openSshOptions(p));
+    card.append(connect, options); root.append(card);
   }
 }
 function updateSession(s) {
+  if (s.kind === 'local' && !canUseLocalTerminal) return;
+  const previous = sessions.get(s.id);
+  if (s.kind === 'local' && previous?.generation > s.generation) return;
   if (ready) {
     if (s.status === 'open') confirmedOpenSessions.add(s.id);
     else confirmedOpenSessions.delete(s.id);
+    if (s.kind === 'local') confirmedLocalSessions.add(s.id);
   }
   if (s.status === 'closed' && dismissedTabs.has(s.id)) {
     if (sessions.has(s.id)) { sessions.set(s.id, s); dismissClosedTab(s.id, false); }
     return;
   }
   sessions.set(s.id, s); ensureTerminal(s); if (!activeId) activeId = s.id; renderTabs(); renderActive();
+  if (pendingLocalActivation === s.id) { pendingLocalActivation = undefined; activate(s.id); }
 }
 function dismissClosedTab(id, publish = true) {
   if (sessions.get(id)?.status !== 'closed') return;
@@ -122,6 +135,7 @@ function dismissClosedTab(id, publish = true) {
   if (publish && ready) request('dismiss-tab', { sessionId: id }).catch(e => toast(`页签已在本页移除，跨页面同步失败：${e.message}`));
   if (terminal) { clearTimeout(terminal.schedule); terminal.input = ''; terminal.term.dispose(); terminal.pane.remove(); }
   terminals.delete(id); sessions.delete(id); sessionMessages.delete(id); messageDrafts.delete(id);
+  confirmedLocalSessions.delete(id);
   if (activeId === id) {
     const remaining = [...sessions.keys()];
     activeId = remaining[Math.min(index, remaining.length - 1)] ?? null;
@@ -136,12 +150,14 @@ function renderTabs() {
     const tab = element('button', `tab${s.id === activeId ? ' active' : ''}${s.status === 'closed' ? ' dismissible' : ''}`); tab.setAttribute('role', 'tab'); tab.setAttribute('aria-selected', String(s.id === activeId));
     const kind = s.status === 'closed' ? '' : s.lock?.kind || 'free';
     tab.append(element('i', `tab-dot ${kind}`));
-    const text = element('div', 'tab-text'); text.append(element('span', 'tab-title', s.name), element('span', 'tab-subtitle', `${s.currentUser || s.loginUser}@${s.host} · ${actorLabel(s.assignedTo)}`)); tab.append(text);
+    const local = s.kind === 'local';
+    const subtitle = local ? `本地 · ${localStateLabels[s.processState] || '状态未知'} · ${s.cwd}` : `${s.currentUser || s.loginUser}@${s.host} · ${actorLabel(s.assignedTo)}`;
+    const text = element('div', 'tab-text'); text.append(element('span', 'tab-title', s.name), element('span', 'tab-subtitle', subtitle)); tab.append(text);
     tab.title = `${s.id}\n关联 Agent：${actorLabel(s.assignedTo)}`;
     if (s.lock) tab.append(element('span', 'tab-lock', s.lock.kind === 'agent' ? `🔒 ${s.lock.agent?.name || 'Agent'}` : s.privateMode ? '私密' : '🔒 用户'));
-    if (s.status === 'closed') tab.append(element('span', 'muted', '已关闭'));
+    if (!local && s.status === 'closed') tab.append(element('span', 'muted', '已关闭'));
     tab.addEventListener('click', () => activate(s.id)); item.append(tab);
-    if (s.status === 'closed') {
+    if (!local && s.status === 'closed') {
       const dismiss = element('button', 'tab-close', '×');
       dismiss.title = '移除已关闭页签'; dismiss.setAttribute('aria-label', `移除已关闭页签 ${s.name}`);
       dismiss.addEventListener('click', () => dismissClosedTab(s.id)); item.append(dismiss);
@@ -152,20 +168,49 @@ function renderTabs() {
 function activate(id) { activeId = id; renderTabs(); renderActive(); setTimeout(() => fitActive(), 20); terminals.get(id)?.term.focus(); }
 function canReturnToAgent(s) {
   return ready && s.status === 'open' && !!s.handoff && !!s.assignedTo &&
+    (s.kind !== 'local' || s.processState === 'running') &&
     (!s.lock || (s.lock.kind === 'user' && s.lock.owner === clientId));
+}
+function renderLocalSession(s) {
+  const local = s.kind === 'local';
+  const busy = local && localActionsPending.has(s.id);
+  $('close-session').classList.toggle('hidden', local);
+  const status = $('local-session-status');
+  status.classList.toggle('hidden', !local);
+  status.textContent = local ? [
+    localStateLabels[s.processState] || '状态未知',
+    s.cwd,
+    s.command || 'PowerShell',
+    s.exitCode != null ? `退出码 ${s.exitCode}` : '',
+    s.forced ? '已强制停止' : '',
+    s.historyTruncated ? '较早的滚动历史已截断' : '',
+  ].filter(Boolean).join(' · ') : '';
+  const transitioning = s.processState === 'starting' || s.processState === 'stopping';
+  for (const [id, available] of [
+    ['stop-local-session', s.processState === 'running'],
+    ['force-local-session', s.processState === 'running'],
+    ['restart-local-session', !transitioning],
+    ['delete-local-session', !transitioning],
+  ]) {
+    $(id).classList.toggle('hidden', !local);
+    $(id).disabled = !local || !ready || busy || !available;
+  }
 }
 function renderActive() {
   const s = sessions.get(activeId);
   $('empty').classList.toggle('hidden', !!s); $('session-panel').classList.toggle('hidden', !s);
   for (const [id, t] of terminals) t.pane.classList.toggle('hidden', id !== activeId);
   if (!s) return;
-  $('session-host').textContent = `${s.host}:${s.port}`;
-  $('session-user').textContent = `SSH ${s.loginUser}${s.currentUser ? ' → ' + s.currentUser : ''}`;
+  const local = s.kind === 'local';
+  const canControl = ready && s.status === 'open' && (!local || s.processState === 'running');
+  $('session-host').textContent = local ? s.name : `${s.host}:${s.port}`;
+  $('session-user').textContent = local ? '本地终端' : `SSH ${s.loginUser}${s.currentUser ? ' → ' + s.currentUser : ''}`;
+  renderLocalSession(s);
   const mine = s.lock?.kind === 'user' && s.lock.owner === clientId;
   $('session-ownership').textContent = `创建：${s.createdBy?.kind === 'agent' ? actorLabel(s.createdBy.agent) : '用户'}　｜　关联 Agent：${actorLabel(s.assignedTo)}`;
   let banner = s.assignedTo ? `共享画面 · ${actorLabel(s.assignedTo)} 可观察当前画面和滚动历史；输入一次只由一方控制。` : '用户会话 / 待交接 · 复制 sessionId 给指定 Agent 认领；输入权由所有页面和已关联 Agent 共用一把锁。', kind = '';
-  if (!ready) { banner = '与共端服务的连接已中断，正在重连。SSH 状态将在连接后确认。'; kind = 'private'; }
-  else if (s.status === 'closed') banner = 'SSH 连接已关闭。可查看已有输出，或点击页签右侧 × 移除此页签；重新连接请使用左侧服务器列表。';
+  if (!ready) { banner = `与共端服务的连接已中断，正在重连。${local ? '本地终端' : 'SSH'} 状态将在连接后确认。`; kind = 'private'; }
+  else if (s.status === 'closed') banner = local ? '可查看已有输出，或选择「重启」「删除会话」。' : 'SSH 连接已关闭。可查看已有输出，或点击页签右侧 × 移除此页签；重新连接请使用左侧服务器列表。';
   else if (s.privateMode) { banner = `私密已开启 · Agent 无权观察或输入，屏幕仍保留。${s.lock && !mine ? '输入由另一方持有，请点击「接管输入权」后操作。' : '关闭私密后，当前画面和仍保留的历史将可被 Agent 看到。'}`; kind = 'private'; }
   else if (s.handoff) {
     banner = s.lock ? (mine ? '当前页面持有输入权。' : '另一页面持有输入权。') : '输入权空闲，可接管输入权或直接开始输入。';
@@ -178,14 +223,14 @@ function renderActive() {
   $('status-banner').className = 'status-banner ' + kind; $('status-banner').textContent = banner;
   $('session-detail').textContent = `输入权：${s.lock ? mine ? '当前页面' : s.lock.kind === 'agent' ? actorLabel(s.lock.agent) : '另一页面' : '空闲'}  ·  ${s.id.slice(0, 8)}`;
   $('terminal-size').textContent = `${s.cols} × ${s.rows}`;
-  for (const id of ['interrupt', 'close-session']) $(id).disabled = !ready || s.status !== 'open';
-  $('takeover').disabled = !ready || s.status !== 'open' || mine || controlPending.has(s.id);
+  for (const id of ['interrupt', 'close-session']) $(id).disabled = !canControl;
+  $('takeover').disabled = !canControl || mine || controlPending.has(s.id);
   $('takeover').title = mine ? '当前页面已持有输入权' : s.lock ? '将输入权从当前持有者切换到此页面' : '获取空闲的输入权';
   $('private').textContent = s.privateMode ? '私密：开' : '私密：关';
   $('private').title = s.privateMode ? '关闭私密，让 Agent 看到当前画面和保留历史' : '开启私密，禁止 Agent 观察；不清屏、不切换输入权';
   $('private').disabled = !ready;
   $('clear-history').disabled = !ready;
-  $('release').disabled = !ready || s.status !== 'open' || !mine || controlPending.has(s.id);
+  $('release').disabled = !canControl || !mine || controlPending.has(s.id);
   $('release').title = mine ? (s.handoff ? '释放输入权并结束人工交接' : '释放当前页面的输入锁；保留运行程序与未发送输入') : '只有当前页面持有输入权时才能释放';
   $('copy-session').disabled = !ready;
   $('view-history').disabled = !ready;
@@ -298,6 +343,10 @@ function showPairing(message) {
   messageDrafts.clear();
   normalHistoryRevisions.clear();
   profiles = [];
+  canUseLocalTerminal = false;
+  pendingLocalActivation = undefined;
+  runConfigs = [];
+  renderRunConfigs();
   importCandidates = [];
   activeId = null;
   messagesOpen = false;
@@ -451,18 +500,30 @@ function openTerminalSocket(url) {
   function applyPacket(p) {
     if (p.type === 'hello') {
       clientId = p.clientId; profiles = p.profiles;
-      for (const s of p.sessions) { updateSession(s); terminals.get(s.id)?.term.reset(); }
+      canUseLocalTerminal = p.capabilities?.localTerminal === true;
+      runConfigs = [];
+      for (const s of p.sessions) {
+        if (s.kind === 'local' && !canUseLocalTerminal) continue;
+        updateSession(s);
+        terminals.get(s.id)?.term.reset();
+      }
     } else if (p.type === 'synced') {
       clearTimeout(syncTimeout);
       const instanceId = typeof hello.instanceId === 'string' && hello.instanceId ? hello.instanceId : undefined;
-      const currentIds = new Set(p.sessions.map(s => s.id));
-      if (confirmedInstanceId && instanceId && confirmedInstanceId !== instanceId &&
-          [...confirmedOpenSessions].some(id => !currentIds.has(id))) {
+      const visibleSessions = p.sessions.filter(s => canUseLocalTerminal || s.kind !== 'local');
+      const currentIds = new Set(visibleSessions.map(s => s.id));
+      const localLost = [...confirmedLocalSessions].some(id => !currentIds.has(id));
+      const sshLost = [...confirmedOpenSessions].some(id => !confirmedLocalSessions.has(id) && !currentIds.has(id));
+      if (confirmedInstanceId && instanceId && confirmedInstanceId !== instanceId && (localLost || sshLost)) {
+        $('restart-notice-text').textContent = localLost
+          ? `共端服务已重新启动。此前的${sshLost ? '本地终端和 SSH' : '本地终端'}会话已丢失。运行配置仍可手动启动。`
+          : '共端服务已重新启动，此前的 SSH 会话已结束。请在「服务器」列表点击「连接 ↗」建立新会话。';
         $('restart-notice').classList.remove('hidden');
         for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
       }
       confirmedInstanceId = instanceId;
-      confirmedOpenSessions = new Set(p.sessions.filter(s => s.status === 'open').map(s => s.id));
+      confirmedOpenSessions = new Set(visibleSessions.filter(s => s.status === 'open').map(s => s.id));
+      confirmedLocalSessions = new Set(visibleSessions.filter(s => s.kind === 'local').map(s => s.id));
       canSavePassword = hello.capabilities?.savePassword !== false;
       updateAuth();
       pruneSessionViews(currentIds);
@@ -470,7 +531,9 @@ function openTerminalSocket(url) {
       saveDismissedTabs();
       $('workspace').classList.remove('hidden');
       $('workspace').inert = false;
-      ready = true; for (const s of p.sessions) updateSession(s);
+      ready = true; for (const s of visibleSessions) updateSession(s);
+      renderRunConfigs();
+      if (canUseLocalTerminal) void loadRunConfigs();
       try {
         const restored = sessionStorage.getItem('shared-ssh-active-tab'); sessionStorage.removeItem('shared-ssh-active-tab');
         if (sessions.has(restored)) activate(restored);
@@ -478,7 +541,13 @@ function openTerminalSocket(url) {
       $('connection-dot').classList.add('connected'); $('connection-text').textContent = '本地服务已连接'; renderProfiles(); renderTabs(); renderActive(); setTimeout(fitActive, 30);
       refreshUpdatedUi(hello.uiVersion);
       hello = undefined;
-    } else if (p.type === 'state') updateSession(p.session);
+    } else if (p.sessionId && p.generation < sessions.get(p.sessionId)?.generation) return;
+    else if (p.type === 'state') updateSession(p.session);
+    else if (p.type === 'run-configs' && canUseLocalTerminal) {
+      runConfigsRevision++;
+      runConfigs = p.runConfigs;
+      renderRunConfigs();
+    }
     else if (p.type === 'profiles') { profiles = p.profiles; renderProfiles(); }
     else if (p.type === 'messages') { sessionMessages.set(p.sessionId, p.messages); if (p.sessionId === activeId) renderMessages(); }
     else if (p.type === 'dismissed') {
@@ -516,7 +585,10 @@ function openTerminalSocket(url) {
     hello = undefined;
     initialEvents = [];
     ready = false; $('connection-dot').classList.remove('connected');
+    pendingLocalActivation = undefined;
     $('workspace').inert = true;
+    for (const id of ['local-launch-dialog', 'run-config-dialog', 'ssh-launch-dialog']) $(id).close();
+    renderRunConfigs();
     for (const t of terminals.values()) { t.input = ''; clearTimeout(t.schedule); t.schedule = null; }
     for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('连接已断开；不自动重发输入')); } pending.clear();
     renderProfiles(); renderActive();
@@ -585,6 +657,7 @@ function openProfile(p) {
   const form = $('profile-form'); form.reset(); form.elements.id.value = '';
   $('dialog-title').textContent = p ? '编辑服务器' : '添加服务器'; $('delete-profile').classList.toggle('hidden', !p);
   if (p) for (const key of ['id', 'name', 'host', 'port', 'username', 'auth', 'identityFile', 'note']) form.elements[key].value = p[key] || '';
+  $('ssh-profile-directory').value = p?.startupDir ?? '';
   form.elements.savePassword.checked = !!p?.savePassword;
   form.dataset.hasSavedPassword = p?.savePassword ? 'true' : 'false';
   form.elements.password.placeholder = p?.savePassword ? '已保存；留空保留原密码，输入新密码可替换' : '输入登录密码';
@@ -603,6 +676,157 @@ function updateAuth() {
   form.elements.password.required = saved && form.dataset.hasSavedPassword !== 'true';
   if (!saved) form.elements.password.value = '';
 }
+
+async function connectSsh(profileId, startupDir = '') {
+  const args = startupDir.trim() ? { profileId, startupDir } : { profileId };
+  const session = await request('create', args);
+  updateSession(session);
+  activate(session.id);
+}
+let sshLaunchProfileId;
+function openSshOptions(profile) {
+  sshLaunchProfileId = profile.id;
+  $('ssh-launch-directory').value = '';
+  $('ssh-launch-status').textContent = '';
+  $('ssh-launch-dialog').showModal();
+}
+$('ssh-launch-form').addEventListener('submit', event => {
+  void submitDialog(event, 'ssh-launch', () => connectSsh(sshLaunchProfileId, $('ssh-launch-directory').value));
+});
+
+async function submitDialog(event, prefix, action) {
+  if (event.submitter?.value === 'cancel') return;
+  event.preventDefault();
+  await performDialogAction(prefix, action);
+}
+async function performDialogAction(prefix, action) {
+  const submit = $(prefix + '-submit'), status = $(prefix + '-status'), dialog = $(prefix + '-dialog');
+  if (submit.disabled) return;
+  submit.disabled = true;
+  status.textContent = '';
+  try { await action(); dialog.close(); }
+  catch (error) { status.textContent = error.message; }
+  finally { submit.disabled = false; }
+}
+
+function renderRunConfigs() {
+  $('local-launchers').classList.toggle('hidden', !ready || !canUseLocalTerminal);
+  const list = $('run-configs');
+  list.replaceChildren();
+  if (!ready || !canUseLocalTerminal) return;
+  for (const config of runConfigs) {
+    const card = element('div', 'profile-card');
+    const heading = element('div', 'profile-title');
+    const edit = element('button', '', '···');
+    edit.title = '编辑运行配置';
+    edit.addEventListener('click', () => openRunConfig(config));
+    heading.append(element('strong', '', config.name), edit);
+    const start = element('button', 'profile-connect', '启动');
+    start.addEventListener('click', async () => {
+      if (start.disabled) return;
+      start.disabled = true;
+      try { await startLocal('start-run', { configId: config.id }); }
+      catch (error) { toast(error.message); }
+      finally { start.disabled = false; }
+    });
+    card.append(heading, element('div', 'profile-address', config.cwd));
+    if (config.note) card.append(element('div', 'profile-note', config.note));
+    card.append(start);
+    list.append(card);
+  }
+}
+async function loadRunConfigs() {
+  const connection = socket, revision = runConfigsRevision;
+  try {
+    const configs = await api('/api/run-configs');
+    if (socket !== connection || !canUseLocalTerminal || revision !== runConfigsRevision) return;
+    runConfigs = configs;
+    renderRunConfigs();
+  } catch (error) {
+    if (ready && socket === connection) toast(error.message);
+  }
+}
+async function startLocal(type, args) {
+  if (!canUseLocalTerminal) throw new Error('当前入口不支持本地终端');
+  const { sessionId } = await request(type, args);
+  if (sessions.has(sessionId)) activate(sessionId);
+  else pendingLocalActivation = sessionId;
+}
+let launchLocalCommand = false;
+function openLocalLaunch(command) {
+  if (!ready || !canUseLocalTerminal) return;
+  launchLocalCommand = command;
+  $('local-launch-form').reset();
+  $('local-launch-title').textContent = command ? '运行一次性命令' : '打开 PowerShell';
+  $('local-launch-optional').classList.toggle('hidden', command);
+  $('local-launch-directory').required = command;
+  $('local-launch-command-field').classList.toggle('hidden', !command);
+  $('local-launch-command').disabled = !command;
+  $('local-launch-command').required = command;
+  $('local-launch-status').textContent = '';
+  $('local-launch-submit').disabled = false;
+  $('local-launch-dialog').showModal();
+}
+$('open-local-shell').addEventListener('click', () => openLocalLaunch(false));
+$('run-local-command').addEventListener('click', () => openLocalLaunch(true));
+$('local-launch-form').addEventListener('submit', event => {
+  void submitDialog(event, 'local-launch', () => {
+    const cwd = $('local-launch-directory').value;
+    return launchLocalCommand
+      ? startLocal('start-run', { cwd, command: $('local-launch-command').value })
+      : startLocal('open-local-shell', cwd.trim() ? { cwd } : {});
+  });
+});
+
+let editingRunConfigId;
+function openRunConfig(config) {
+  if (!ready || !canUseLocalTerminal) return;
+  editingRunConfigId = config?.id;
+  $('run-config-title').textContent = config ? '编辑运行配置' : '添加运行配置';
+  $('run-config-name').value = config?.name ?? '';
+  $('run-config-directory').value = config?.cwd ?? '';
+  $('run-config-command').value = config?.command ?? '';
+  $('run-config-note').value = config?.note ?? '';
+  $('run-config-status').textContent = '';
+  $('delete-run-config').classList.toggle('hidden', !config);
+  $('run-config-submit').disabled = false;
+  $('run-config-dialog').showModal();
+}
+$('add-run-config').addEventListener('click', () => openRunConfig());
+$('run-config-form').addEventListener('submit', event => {
+  void submitDialog(event, 'run-config', () => api('/api/run-configs', {
+    method: 'POST',
+    body: JSON.stringify({ id: editingRunConfigId, name: $('run-config-name').value,
+      cwd: $('run-config-directory').value, command: $('run-config-command').value, note: $('run-config-note').value }),
+  }));
+});
+$('delete-run-config').addEventListener('click', async () => {
+  if (!ready || !canUseLocalTerminal || !editingRunConfigId || $('run-config-submit').disabled) return;
+  if (!confirm('删除此运行配置？已启动的会话会继续运行。')) return;
+  await performDialogAction('run-config', () =>
+    api('/api/run-configs/' + editingRunConfigId, { method: 'DELETE' }));
+});
+
+for (const [id, type, message, mode] of [
+  ['stop-local-session', 'stop-session'],
+  ['force-local-session', 'stop-session', '强制停止此本地会话的进程？', 'force'],
+  ['restart-local-session', 'restart-session', '重启此本地会话并清空现有画面？'],
+  ['delete-local-session', 'delete-session', '停止并删除此本地会话？已有画面会清除。'],
+]) {
+  $(id).addEventListener('click', async () => {
+    const session = sessions.get(activeId);
+    if (!ready || !canUseLocalTerminal || session?.kind !== 'local' || $(id).disabled) return;
+    if (message && !confirm(message)) return;
+    const terminal = terminals.get(session.id);
+    if (terminal?.sending || terminal?.input) { toast('输入正在发送，请稍后操作'); return; }
+    localActionsPending.add(session.id);
+    renderActive();
+    try {
+      await request(type, mode ? { sessionId: session.id, mode } : { sessionId: session.id }, 30000);
+    } catch (error) { toast(error.message); }
+    finally { localActionsPending.delete(session.id); renderActive(); }
+  });
+}
 $('add-server').addEventListener('click', () => openProfile()); $('empty-add').addEventListener('click', () => openProfile());
 for (const id of ['dialog-close', 'dialog-cancel']) $(id).addEventListener('click', () => $('profile-dialog').close());
 $('profile-form').elements.auth.addEventListener('change', updateAuth);
@@ -611,6 +835,8 @@ $('profile-form').elements.savePassword.addEventListener('change', updateAuth);
 $('profile-dialog').addEventListener('close', () => { $('profile-form').elements.password.value = ''; });
 $('profile-form').addEventListener('submit', async event => {
   event.preventDefault(); const p = Object.fromEntries(new FormData(event.target)); p.port = Number(p.port); if (!p.id) delete p.id; if (p.auth !== 'key') delete p.identityFile;
+  const startupDir = $('ssh-profile-directory').value;
+  if (startupDir.trim()) p.startupDir = startupDir;
   if (canSavePassword) p.savePassword = p.auth === 'password' && event.target.elements.savePassword.checked;
   else delete p.savePassword;
   if (!p.savePassword || !p.password) delete p.password;

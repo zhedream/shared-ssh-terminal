@@ -1,6 +1,6 @@
 ---
 name: shared-ssh-terminal
-description: Operate a user-authorized shared SSH terminal through 共端, including session discovery, input control and human handoff.
+description: Use 共端 when the user explicitly asks to share a terminal or the current task already has an authorized shared session. Covers session discovery, input control, and human handoff.
 ---
 
-Run `shared-ssh-terminal skill` to read the instructions for the installed version. Follow them for this session.
+Use the current task's normal execution environment by default. For authorized shared work, run `shared-ssh-terminal skill` and follow the installed version's instructions.

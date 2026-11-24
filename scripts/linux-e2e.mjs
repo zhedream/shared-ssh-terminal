@@ -74,7 +74,7 @@ async function openBrowser(origin, cookie) {
     }
     const request = pending.get(message.requestId);
     if (message.type === 'ack') request?.resolve(message.result);
-    if (message.type === 'error') request?.reject(new Error(message.error));
+    if (message.type === 'error') request?.reject(Object.assign(new Error(message.error), { code: message.code }));
   });
   await until(() => { if (failure) throw failure; return synced; }, 'browser synchronization');
   const send = async (type, args) => {
@@ -104,6 +104,13 @@ try {
   const identity = rsa();
   await writeFile(identityFile, identity, { mode: 0o600 });
   const publicKey = ssh2.utils.parseKey(identity);
+  const savedDirectory = "saved SSH directory's fixture";
+  const overrideDirectory = '-one-time SSH directory';
+  const missingDirectory = 'missing SSH directory';
+  await mkdir(path.join(temporary, savedDirectory));
+  await mkdir(path.join(temporary, overrideDirectory));
+  const loginShell = path.join(temporary, 'fixture login shell');
+  await writeFile(loginShell, '#!/bin/sh\n[ "$1" = -l ] || exit 23\nexec /bin/sh -i\n', { mode: 0o700 });
   const password = `fixture-${randomUUID()}`;
   ssh = new ssh2.Server({ hostKeys: [hostKey] }, peer => {
     transports++;
@@ -125,10 +132,9 @@ try {
         windowSize = `${info.rows} ${info.cols}`;
         acceptResize?.();
       });
-      session.on('shell', acceptShell => {
-        const stream = acceptShell();
-        child = spawn('/bin/sh', ['-i'], { name: 'xterm-256color', cols, rows, cwd: temporary,
-          env: { PATH: env.PATH, HOME: temporary, TERM: 'xterm-256color', ENV: '/dev/null', PS1: 'sst-linux> ' } });
+      const serveShell = (stream, argv) => {
+        child = spawn('/bin/sh', argv, { name: 'xterm-256color', cols, rows, cwd: temporary,
+          env: { PATH: env.PATH, HOME: temporary, SHELL: loginShell, TERM: 'xterm-256color', ENV: '/dev/null', PS1: 'sst-linux> ' } });
         shells.add(child);
         const stopShell = () => { if (shells.has(child)) child.kill(); };
         stream.on('error', stopShell);
@@ -137,7 +143,9 @@ try {
         child.onData(chunk => { if (!stream.destroyed) stream.write(chunk); });
         stream.on('data', bytes => child.write(String(bytes)));
         child.onExit(({ exitCode }) => { shells.delete(child); if (!stream.destroyed) { stream.exit(exitCode); stream.end(); } });
-      });
+      };
+      session.on('shell', acceptShell => serveShell(acceptShell(), ['-i']));
+      session.on('exec', (acceptExec, _reject, info) => serveShell(acceptExec(), ['-c', info.command]));
     }));
   });
   await new Promise((resolve, reject) => {
@@ -172,7 +180,16 @@ try {
   const a = await openBrowser(issued.origin, cookie);
   const b = await openBrowser(issued.origin, cookie);
   assert.equal(a.hello.instanceId, b.hello.instanceId);
-  assert.deepEqual(a.hello.capabilities, { savePassword: false });
+  const capabilities = { savePassword: false, localTerminal: false, localTerminalUnavailableReason: 'platform_not_supported' };
+  assert.deepEqual(a.hello.capabilities, capabilities);
+  assert.deepEqual(b.hello.capabilities, capabilities);
+  const stateResponse = await fetch(`${issued.origin}/api/state`, { headers: { Cookie: cookie } });
+  assert.equal(stateResponse.status, 200);
+  assert.deepEqual((await stateResponse.json()).capabilities, capabilities);
+  const runConfigResponse = await fetch(`${issued.origin}/api/run-configs`, { headers: { Cookie: cookie } });
+  assert.equal(runConfigResponse.status, 501);
+  assert.equal((await runConfigResponse.json()).code, 'local_terminal_unavailable');
+  await assert.rejects(a.send('open-local-shell'), { code: 'local_terminal_unavailable' });
 
   const save = data => fetch(`${issued.origin}/api/profiles`, { method: 'POST', headers: { Origin: issued.origin, Cookie: cookie,
     'Content-Type': 'application/json' }, body: JSON.stringify(data), signal: AbortSignal.timeout(4000) });
@@ -214,6 +231,8 @@ try {
 
   const transport = new StdioClientTransport({ command: process.execPath, args: [cli, 'mcp'], cwd: temporary, env, stderr: 'ignore' });
   await client.connect(transport, { timeout: 12000 });
+  assert.deepEqual(await mcp('get_capabilities'), capabilities);
+  assert.equal((await mcp('open_local_shell', {}, true)).structuredContent.code, 'local_terminal_unavailable');
   const attached = await mcp('attach_session', { sessionId: session.id });
   const screen = await mcp('read_screen', { sessionId: session.id });
   assert(screen.lines.some(line => line.text.includes(marker)));
@@ -232,6 +251,32 @@ try {
   await until(() => a.state(refused.id)?.status === 'closed', 'changed host key closes the SSH client');
   await until(() => /REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed/i.test(a.text(refused.id)), 'changed host key refusal');
   await writeFile(knownHosts, known);
+
+  const configured = await save({ ...base, name: 'SSH startup directory fixture', auth: 'key', identityFile, startupDir: savedDirectory });
+  assert.equal(configured.status, 200);
+  const configuredProfile = await configured.json();
+  const checkDirectory = async (target, expected, input) => {
+    await until(() => a.text(target.id).includes('sst-linux> '), 'new SSH directory shell');
+    await input('printf "LT1/%s\\n" "$PWD"\r');
+    await until(() => a.text(target.id).includes(`LT1/${expected}`), 'actual remote startup directory');
+    await input('exit\r');
+    await until(() => a.state(target.id)?.status === 'closed', 'directory SSH session exits');
+  };
+  const saved = await a.send('create', { profileId: configuredProfile.id });
+  assert.equal(saved.startupDir, savedDirectory);
+  await checkDirectory(saved, path.join(temporary, savedDirectory), data => a.input(saved.id, data));
+
+  const overridden = await mcp('create_session', { profileId: configuredProfile.id, startupDir: overrideDirectory });
+  assert.equal(overridden.startupDir, overrideDirectory);
+  const directoryLease = (await mcp('take_control', { sessionId: overridden.id })).lease;
+  await checkDirectory(overridden, path.join(temporary, overrideDirectory), data =>
+    mcp('send_input', { sessionId: overridden.id, lease: directoryLease, data }));
+
+  const missing = await b.send('create', { profileId: configuredProfile.id, startupDir: missingDirectory });
+  assert.equal(missing.startupDir, missingDirectory);
+  await checkDirectory(missing, temporary, data => b.input(missing.id, data));
+  assert.match(a.text(missing.id), /启动目录不可用.*登录目录/);
+
   const beforeRestart = await mcp('create_session', { profileId: keyProfile.id });
   await until(() => a.text(beforeRestart.id).includes('sst-linux> '), 'key login using the accepted fixture fingerprint');
   const seen = transports;
@@ -261,7 +306,7 @@ try {
   assert.notEqual(fresh.id, beforeRestart.id);
   await until(async () => (await mcp('read_screen', { sessionId: fresh.id })).lines.some(line => line.text.includes('sst-linux> ')), 'explicit post-restart key login');
   assert.equal(transports, seen + 1);
-  console.log(`PASS Linux ${process.arch} ${process.version}: CLI, pairing, native SSH/PTY, credential capability, and restart without replay.`);
+  console.log(`PASS Linux ${process.arch} ${process.version}: CLI, pairing, native SSH/PTY, startup directories, platform capabilities, and restart without replay.`);
 } finally {
   await client.close().catch(() => {});
   for (const ws of browsers) ws.terminate();

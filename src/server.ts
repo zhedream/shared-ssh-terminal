@@ -4,11 +4,14 @@ import type { Duplex } from 'node:stream';
 import { readFile, mkdir, unlink } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { homedir } from 'node:os';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer, WebSocket } from 'ws';
 import { z } from 'zod';
-import { Profiles, sshArgs } from './profiles.js';
-import { HandedToUserError, Session } from './sessions.js';
+import { Profiles, sshArgs, sshStartupDirectory } from './profiles.js';
+import { HandedToUserError, LocalSession, Session, type Pty } from './sessions.js';
+import { LocalTerminalError, spawnLocalTerminal, supportsLocalTerminal, type LocalLaunch } from './local-terminal.js';
+import { openLocalInput, RunConfigs, startRunSchema } from './run-configs.js';
 import { readSshConfig } from './ssh-config.js';
 import { hostKeyOptions, resolveLinuxSsh, sshPlatform } from './ssh-platform.js';
 import { Agents, type AgentIdentity } from './agents.js';
@@ -36,12 +39,13 @@ const token = () => randomBytes(32).toString('hex');
 const adminToken = token(), agentToken = token();
 let pairing: Pairing | undefined;
 const profiles = new Profiles(DATA);
+const runConfigs = new RunConfigs(DATA);
 const agents = new Agents();
 const sessions = new Map<string, Session>();
 const messages = new Messages();
 messages.setMaxListeners(100);
-const sockets = new Set<WebSocket>();
-const synchronizing = new Map<WebSocket, unknown[]>();
+const sockets = new Map<WebSocket, boolean>();
+const synchronizing = new Map<WebSocket, { local: boolean; pending: unknown[] }>();
 let shuttingDown = false;
 let creating = 0;
 
@@ -67,8 +71,22 @@ function auth(req: IncomingMessage, secret: string) {
   const expected = Buffer.from(`Bearer ${secret}`);
   return provided.length === expected.length && timingSafeEqual(provided, expected);
 }
+function actualLoopback(req: IncomingMessage) {
+  return req.socket.localAddress === LOCAL_ADDRESS && req.socket.remoteAddress === LOCAL_ADDRESS;
+}
 function localManagement(req: IncomingMessage) {
-  return req.socket.localAddress === LOCAL_ADDRESS && req.socket.remoteAddress === LOCAL_ADDRESS && req.headers.origin === undefined;
+  return actualLoopback(req) && req.headers.origin === undefined;
+}
+function localBrowserAccess(req: IncomingMessage, secure: boolean) {
+  return !secure && actualLoopback(req);
+}
+function capabilities(local: boolean) {
+  const reason = local ? supportsLocalTerminal() ? undefined : 'platform_not_supported' : 'loopback_only';
+  return { savePassword: platform.savePassword, localTerminal: reason === undefined, localTerminalUnavailableReason: reason };
+}
+function requireLocal(local: boolean) {
+  if (!local) throw new LocalTerminalError('local_terminal_unavailable', '本地终端仅允许已配对的本机回环浏览器访问。');
+  if (!supportsLocalTerminal()) throw new LocalTerminalError('local_terminal_unavailable', '本地终端需要支持 ConPTY 的 Windows。');
 }
 function empty(res: ServerResponse) {
   res.writeHead(204, { 'Cache-Control': 'no-store' }).end();
@@ -78,21 +96,103 @@ function send(ws: WebSocket, value: unknown) {
   if (ws.bufferedAmount > 2 * 1024 * 1024) { ws.close(1013, '输出积压，请重新连接'); return; }
   ws.send(JSON.stringify(value));
 }
-function broadcast(value: unknown) {
-  for (const ws of sockets) send(ws, value);
-  for (const [ws, pending] of synchronizing) {
+function broadcast(value: unknown, localOnly = false) {
+  for (const [ws, local] of sockets) if (local || !localOnly) send(ws, value);
+  for (const [ws, { local, pending }] of synchronizing) {
+    if (localOnly && !local) continue;
     if (pending.length > 10000) { ws.close(1013, '同步输出过多，请重新连接'); synchronizing.delete(ws); }
     else pending.push(value);
   }
 }
-function session(id: string) { const s = sessions.get(id); if (!s) throw new Error('会话不存在'); return s; }
-async function createSession(profileId: string, owner: string, creator?: AgentIdentity) {
+function visibleSessions(local: boolean) {
+  return [...sessions.values()].filter(s => local || s.kind === 'ssh');
+}
+function visibleSession(id: string, local: boolean) {
+  const s = sessions.get(id);
+  return s && (local || s.kind === 'ssh') ? s : undefined;
+}
+function session(id: string, local = true) {
+  const s = visibleSession(id, local);
+  if (!s) throw new LocalTerminalError('session_not_found', '会话不存在');
+  return s;
+}
+function registerSession(s: Session) {
+  sessions.set(s.id, s);
+  const publish = (event: unknown) => {
+    if (sessions.get(s.id) === s) broadcast(event, s.kind === 'local');
+  };
+  s.on('state', state => { messages.changed(); publish({ type: 'state', session: state }); });
+  s.on('output', output => publish({ type: 'output', sessionId: s.id, ...output }));
+  s.on('reset', reset => publish({ type: 'reset', sessionId: s.id, ...reset }));
+  s.on('resize', size => publish({ type: 'resize', sessionId: s.id, ...size }));
+  s.on('exit', exitCode => publish({ type: 'exit', sessionId: s.id, exitCode, generation: s.processGeneration }));
+  publish({ type: 'state', session: s.summary() });
+}
+function dismissSession(s: Session) {
+  sessions.delete(s.id); messages.clear(s.id);
+  broadcast({ type: 'dismissed', sessionId: s.id }, s.kind === 'local');
+}
+function localSession(s: Session) {
+  if (!(s instanceof LocalSession)) throw new LocalTerminalError('lifecycle_conflict', '此操作仅用于本地终端。');
+  return s;
+}
+function launchLocal(s: LocalSession) {
+  return (bind: (pty: Pty) => void, signal: AbortSignal) => spawnLocalTerminal(pty.spawn, RUNTIME, s.launch, s.cols, s.rows, bind, signal);
+}
+function concurrentLocal(key: string | undefined, exclude?: LocalSession) {
+  if (!key) return;
+  return [...sessions.values()].find((s): s is LocalSession =>
+    s instanceof LocalSession && s !== exclude && s.deduplicationKey === key && s.occupied);
+}
+async function startLocal(launch: LocalLaunch, owner: string, creator?: AgentIdentity, explicitKey?: string) {
   if (shuttingDown) throw new Error('服务正在停止');
-  if (creating + [...sessions.values()].filter(s => s.status === 'open').length >= 16) throw new Error('最多同时打开 16 个连接');
+  const key = launch.runConfigId ? 'config:' + launch.runConfigId
+    : explicitKey === undefined ? undefined : JSON.stringify([creator ? 'agent' : 'browser', creator?.id ?? owner, explicitKey]);
+  const signature = JSON.stringify(launch);
+  const previous = concurrentLocal(key);
+  if (previous) {
+    if (!launch.runConfigId && previous.signature !== signature) throw new LocalTerminalError('start_conflict', '此启动标识已用于其他启动参数。');
+    await previous.waitForStart();
+    return { sessionId: previous.id, reused: true };
+  }
+  if ([...sessions.values()].filter(s => s instanceof LocalSession && s.occupied).length >= 16) throw new Error('最多同时打开 16 个本地终端');
+  const s = new LocalSession(launch, key, signature, owner, creator);
+  registerSession(s);
+  try { await s.start(launchLocal(s)); }
+  catch (error) { dismissSession(s); throw error; }
+  return { sessionId: s.id, reused: false };
+}
+function openLocal(value: unknown, owner: string, actor?: AgentIdentity) {
+  const { cwd, startKey } = z.object(openLocalInput).parse(value);
+  return startLocal({ kind: 'local', name: 'PowerShell', cwd: cwd ?? homedir() }, owner, actor, startKey);
+}
+function startRun(value: unknown, owner: string, actor?: AgentIdentity) {
+  const input = startRunSchema.parse(value);
+  if (input.configId) {
+    const { id: runConfigId, name, cwd, command } = runConfigs.get(input.configId);
+    return startLocal({ kind: 'local', runConfigId, name, cwd, command }, owner, actor);
+  }
+  return startLocal({ kind: 'local', name: input.name ?? '本地命令', cwd: input.cwd!, command: input.command! }, owner, actor, input.startKey);
+}
+async function restartLocal(s: LocalSession, actor?: AgentIdentity) {
+  if (shuttingDown) throw new Error('服务正在停止');
+  if (concurrentLocal(s.deduplicationKey, s)) throw new LocalTerminalError('start_conflict', '同一启动标识已有本地终端在运行。');
+  if (!s.occupied && [...sessions.values()].filter(other => other instanceof LocalSession && other.occupied).length >= 16) {
+    throw new Error('最多同时打开 16 个本地终端');
+  }
+  await s.restart(launchLocal(s), actor && (() => {
+    s.requireAssignee(actor);
+    if (s.privateMode) throw new Error('私密模式已开启，Agent 无权重启终端');
+  }));
+}
+async function createSession(profileId: string, owner: string, creator?: AgentIdentity, startupDir?: string) {
+  if (shuttingDown) throw new Error('服务正在停止');
+  if (creating + visibleSessions(false).filter(s => s.status === 'open').length >= 16) throw new Error('最多同时打开 16 个连接');
   creating++;
   let saved: SavedPasswordPty | undefined;
   try {
     const profile = profiles.get(profileId);
+    if (startupDir !== undefined) profile.startupDir = startupDir;
     const linux = platform.platform === 'linux';
     const args = sshArgs(profile, platform.configFile, hostKeyOptions(platform.platform, DATA));
     let cwd = linux ? DATA : ROOT;
@@ -122,13 +222,7 @@ async function createSession(profileId: string, owner: string, creator?: AgentId
     }
     saved?.bind(child);
     const s = new Session(profile, saved ?? child, owner, creator);
-    sessions.set(s.id, s);
-    s.on('state', state => { messages.changed(); broadcast({ type: 'state', session: state }); });
-    s.on('output', output => broadcast({ type: 'output', sessionId: s.id, ...output }));
-    s.on('reset', reset => broadcast({ type: 'reset', sessionId: s.id, ...reset }));
-    s.on('resize', size => broadcast({ type: 'resize', sessionId: s.id, ...size }));
-    s.on('exit', exitCode => broadcast({ type: 'exit', sessionId: s.id, exitCode }));
-    broadcast({ type: 'state', session: s.summary() });
+    registerSession(s);
     return s;
   } catch (error) { saved?.dispose(); throw error; }
   finally { creating--; }
@@ -153,8 +247,14 @@ const readLimits = {
 const agentRequest = z.discriminatedUnion('action', [
   z.object({ action: z.literal('list_profiles') }),
   z.object({ action: z.literal('whoami') }),
+  z.object({ action: z.literal('get_capabilities') }),
+  z.object({ action: z.literal('list_run_configs') }),
+  z.object({ action: z.literal('open_local_shell'), ...openLocalInput }),
+  startRunSchema.safeExtend({ action: z.literal('start_run') }),
+  z.object({ action: z.literal('stop_session'), sessionId: z.guid(), lease: z.guid(), mode: z.never().optional() }),
+  z.object({ action: z.literal('restart_session'), sessionId: z.guid(), lease: z.guid() }),
   z.object({ action: z.literal('list_sessions'), scope: z.enum(['mine', 'all']).default('mine') }),
-  z.object({ action: z.literal('create_session'), profileId: z.guid() }),
+  z.object({ action: z.literal('create_session'), profileId: z.guid(), startupDir: sshStartupDirectory.optional() }),
   z.object({ action: z.literal('attach_session'), sessionId: z.guid() }),
   z.object({ action: z.literal('take_control'), sessionId: z.guid() }),
   z.object({ action: z.literal('release_control'), sessionId: z.guid(), lease: z.guid() }),
@@ -181,17 +281,30 @@ async function agent(value: unknown, actor: AgentIdentity) {
     return { revision: messages.revision, ...messagePage(pendingMessages(actor), 2, 2000) };
   }
   if (p.action === 'whoami') return actor;
+  if (p.action === 'get_capabilities') return capabilities(true);
+  if (p.action === 'list_run_configs') { requireLocal(true); return runConfigs.list(); }
+  if (p.action === 'open_local_shell') { requireLocal(true); return openLocal(p, 'pending-user', actor); }
+  if (p.action === 'start_run') { requireLocal(true); return startRun(p, 'pending-user', actor); }
   if (p.action === 'list_profiles') return profiles.list();
-  if (p.action === 'list_sessions') return [...sessions.values()].filter(s => p.scope === 'all' || s.assignedTo?.id === actor.id).map(s => s.summary(actor.id));
-  if (p.action === 'create_session') return (await createSession(p.profileId, 'pending-user', actor)).summary(actor.id);
+  if (p.action === 'list_sessions') return [...sessions.values()].filter(s => p.scope === 'all' || s.assignedTo?.id === actor.id)
+    .map(s => s instanceof LocalSession ? s.agentSummary(actor.id) : s.summary(actor.id));
+  if (p.action === 'create_session') return (await createSession(p.profileId, 'pending-user', actor, p.startupDir)).summary(actor.id);
+  if (p.action === 'stop_session' || p.action === 'restart_session') {
+    requireLocal(true);
+    const s = localSession(session(p.sessionId));
+    s.requireAgentLease(p.lease, actor, true);
+    if (p.action === 'stop_session') await s.stop('graceful');
+    else await restartLocal(s, actor);
+    return s.agentSummary(actor.id);
+  }
   const s = session(p.sessionId);
-  if (p.action === 'attach_session') { s.attach(actor); return s.summary(actor.id); }
+  if (p.action === 'attach_session') { s.attach(actor); return s instanceof LocalSession ? s.agentSummary(actor.id) : s.summary(actor.id); }
   s.requireAssignee(actor);
   if (p.action === 'read_messages' || p.action === 'acknowledge_messages') {
     if (s.privateMode) throw new Error('私密模式已开启，Agent 无权读取或确认消息');
     if (p.action === 'acknowledge_messages') {
       messages.acknowledge(actor.id, s.id, p.messageIds);
-      broadcast({ type: 'messages', sessionId: s.id, messages: messages.list(s.id) });
+      broadcast({ type: 'messages', sessionId: s.id, messages: messages.list(s.id) }, s.kind === 'local');
       return { acknowledged: p.messageIds };
     }
     const deadline = Date.now() + p.waitMs;
@@ -203,7 +316,10 @@ async function agent(value: unknown, actor: AgentIdentity) {
     return { ...messagePage(visibleMessages(actor, s.id), p.maxMessages, p.maxChars, p.before, p.unreadOnly), instruction: '从最新消息向前分页。阅读后调用 acknowledge_messages 确认收到；确认不等于执行完成。已确认消息保留到用户清空。' };
   }
   if (p.action === 'take_control') return s.acceptControl(actor);
-  if (p.action === 'release_control') { s.releaseAgent(p.lease, actor); return s.summary(actor.id); }
+  if (p.action === 'release_control') {
+    if (s instanceof LocalSession && s.privateMode) throw new Error('私密模式已开启，Agent 无权操作本地终端');
+    s.releaseAgent(p.lease, actor); return s.summary(actor.id);
+  }
   if (p.action === 'handoff_to_user') { s.handoffToUser(p.lease, actor); return s.summary(actor.id); }
   if (p.action === 'request_control_return') { s.requestControlReturn(actor, p.message); return s.summary(actor.id); }
   if (p.action === 'read_screen' || p.action === 'read_history' || p.action === 'read_output') {
@@ -246,6 +362,7 @@ async function handleBrowser(req: IncomingMessage, res: ServerResponse, secure: 
     const requested = new URL(req.url ?? '/', origin);
     if (requested.origin !== origin) return json(res, 403, { error: '来源不被允许' });
     const route = requested.pathname;
+    const local = localBrowserAccess(req, secure);
     if (secure && (route === '/agent' || route.startsWith('/agent/') || route === '/api/pair-code' || route === '/api/shutdown')) {
       return json(res, 404, { error: '接口不存在' });
     }
@@ -298,7 +415,21 @@ async function handleBrowser(req: IncomingMessage, res: ServerResponse, secure: 
       }
       if (!pairing?.expiresAt(req.headers.cookie, hostname, secure)) return json(res, 401, { error: '请先配对浏览器。' });
       if (route === '/api/auth' && req.method === 'GET') return empty(res);
-      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
+      if (route === '/api/state' && req.method === 'GET') return json(res, 200, {
+        profiles: profiles.list(), sessions: visibleSessions(local).map(s => s.summary()), capabilities: capabilities(local),
+      });
+      if (route === '/api/run-configs' || route.startsWith('/api/run-configs/')) {
+        if (!local) return json(res, 404, { error: '接口不存在' });
+        requireLocal(local);
+        if (route === '/api/run-configs' && req.method === 'GET') return json(res, 200, runConfigs.list());
+        let result;
+        if (route === '/api/run-configs' && req.method === 'POST') result = await runConfigs.save(await body(req));
+        else if (/^\/api\/run-configs\/[^/]+$/.test(route) && req.method === 'DELETE') {
+          result = await runConfigs.remove(z.guid().parse(route.split('/').at(-1)));
+        } else return json(res, 404, { error: '接口不存在' });
+        broadcast({ type: 'run-configs', runConfigs: runConfigs.list() }, true);
+        return json(res, 200, result);
+      }
       if (route === '/api/ssh-config' && req.method === 'GET') return json(res, 200, await readSshConfig());
       if (route === '/api/profiles' && req.method === 'POST') {
         const profile = await profiles.save(await body(req));
@@ -318,6 +449,7 @@ async function handleBrowser(req: IncomingMessage, res: ServerResponse, secure: 
   } catch (e: any) {
     if (res.headersSent) res.end();
     else if (e instanceof HandedToUserError) json(res, 409, { error: e.message, code: e.code });
+    else if (e instanceof LocalTerminalError) json(res, e.code === 'local_terminal_unavailable' && !supportsLocalTerminal() ? 501 : 400, { error: e.message, code: e.code });
     else json(res, 400, { error: e.message ?? '操作失败' });
   }
 }
@@ -330,14 +462,14 @@ function browserUpgrade(secure: boolean) {
     if (!instance || shuttingDown || !origin || req.url !== '/terminal') { socket.destroy(); return; }
     const expiry = pairing?.expiresAt(req.headers.cookie, new URL(origin).hostname, secure);
     if (!expiry) { socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); return; }
-    wss.handleUpgrade(req, socket, head, ws => attachBrowser(ws, expiry));
+    wss.handleUpgrade(req, socket, head, ws => attachBrowser(ws, expiry, localBrowserAccess(req, secure)));
   };
 }
 server.on('upgrade', browserUpgrade(false));
-function attachBrowser(ws: WebSocket, expiry: number) {
+function attachBrowser(ws: WebSocket, expiry: number, local: boolean) {
   const clientId = randomUUID();
   const timeout = setTimeout(() => ws.close(1008, '配对已过期'), Math.max(0, expiry - Date.now()));
-  let queue = syncBrowser(ws, clientId).catch(() => { ws.close(1011, '同步失败'); });
+  let queue = syncBrowser(ws, clientId, local).catch(() => { ws.close(1011, '同步失败'); });
   ws.on('message', raw => {
     queue = queue.then(async () => {
       let requestId: string | undefined;
@@ -347,15 +479,33 @@ function attachBrowser(ws: WebSocket, expiry: number) {
         if (ws.readyState !== WebSocket.OPEN || Date.now() >= expiry) return;
         if (typeof requestId !== 'string') throw new Error('请求缺少标识');
         let result: unknown = { ok: true };
-        if (p.type === 'create') result = (await createSession(z.guid().parse(p.profileId), clientId)).summary();
+        if (p.type === 'create') result = (await createSession(z.guid().parse(p.profileId), clientId, undefined, sshStartupDirectory.optional().parse(p.startupDir))).summary();
+        else if (p.type === 'open-local-shell' || p.type === 'start-run') {
+          requireLocal(local);
+          result = await (p.type === 'open-local-shell' ? openLocal(p, clientId) : startRun(p, clientId));
+        }
+        else if (p.type === 'stop-session' || p.type === 'restart-session' || p.type === 'delete-session') {
+          requireLocal(local);
+          const s = localSession(session(z.guid().parse(p.sessionId), local));
+          if (p.type === 'delete-session') { await s.remove(); dismissSession(s); }
+          else {
+            if (p.type === 'restart-session') await restartLocal(s);
+            else await s.stop(z.enum(['graceful', 'force']).default('graceful').parse(p.mode));
+            result = s.summary();
+          }
+        }
         else if (p.type === 'dismiss-tab') {
-          const id = z.guid().parse(p.sessionId), s = sessions.get(id);
-          if (s?.status === 'open') throw new Error('请先关闭 SSH 连接，再移除页签');
-          sessions.delete(id); messages.clear(id);
-          broadcast({ type: 'dismissed', sessionId: id });
+          // Repeating a completed dismissal is a no-op. An inaccessible
+          // local ID is likewise a no-op on the LAN listener.
+          const s = visibleSession(z.guid().parse(p.sessionId), local);
+          if (s) {
+            if (s.status === 'open') throw new Error(s.kind === 'ssh' ? '请先关闭 SSH 连接，再移除页签' : '请先停止本地终端，再移除页签');
+            if (s instanceof LocalSession) await s.remove();
+            dismissSession(s);
+          }
         }
         else {
-          const s = session(z.guid().parse(p.sessionId));
+          const s = session(z.guid().parse(p.sessionId), local);
           if (p.type === 'input') s.userInput(clientId, z.string().max(16000).parse(p.data), z.number().int().parse(p.revision));
           else if (p.type === 'terminal-reply') s.terminalReply(z.string().max(256).parse(p.data));
           else if (p.type === 'takeover') s.takeover(clientId);
@@ -373,31 +523,35 @@ function attachBrowser(ws: WebSocket, expiry: number) {
             if (!s.assignedTo) throw new Error('当前会话尚未关联 Agent，请先提供 sessionId 让 Agent 认领');
             if (z.guid().parse(p.targetAgentId) !== s.assignedTo.id) throw new Error('关联 Agent 已变化，请确认接收者后重新发送');
             result = messages.send(s.id, s.assignedTo, z.string().trim().min(1).max(2000).parse(p.text));
-            broadcast({ type: 'messages', sessionId: s.id, messages: messages.list(s.id) });
+            broadcast({ type: 'messages', sessionId: s.id, messages: messages.list(s.id) }, s.kind === 'local');
           }
-          else if (p.type === 'clear-messages') { messages.clear(s.id); broadcast({ type: 'messages', sessionId: s.id, messages: [] }); }
-          else if (p.type === 'clear-history') { await s.clearHistory(); messages.clear(s.id); broadcast({ type: 'messages', sessionId: s.id, messages: [] }); }
+          else if (p.type === 'clear-messages') { messages.clear(s.id); broadcast({ type: 'messages', sessionId: s.id, messages: [] }, s.kind === 'local'); }
+          else if (p.type === 'clear-history') { await s.clearHistory(); messages.clear(s.id); broadcast({ type: 'messages', sessionId: s.id, messages: [] }, s.kind === 'local'); }
           else if (p.type === 'resize') await s.resize(z.number().int().min(20).max(400).parse(p.cols), z.number().int().min(5).max(160).parse(p.rows));
-          else if (p.type === 'close') s.close();
+          else if (p.type === 'close') { if (s instanceof LocalSession) await s.stop('graceful'); else s.close(); }
           else throw new Error('未知终端操作');
         }
         send(ws, { type: 'ack', requestId, result });
-      } catch (e: any) { send(ws, { type: 'error', requestId, error: e.message ?? '操作失败' }); }
+      } catch (e: any) {
+        send(ws, { type: 'error', requestId, error: e.message ?? '操作失败',
+          code: e instanceof LocalTerminalError || e instanceof HandedToUserError ? e.code : undefined });
+      }
     }).catch(() => ws.close(1011, '会话错误'));
   });
   ws.on('error', () => {});
   ws.on('close', () => { clearTimeout(timeout); sockets.delete(ws); synchronizing.delete(ws); });
 }
 
-async function syncBrowser(ws: WebSocket, clientId: string) {
+async function syncBrowser(ws: WebSocket, clientId: string, local: boolean) {
   const pending: any[] = [];
-  synchronizing.set(ws, pending);
+  synchronizing.set(ws, { local, pending });
   try {
-    send(ws, { type: 'hello', instanceId, uiVersion, clientId, capabilities: { savePassword: platform.savePassword },
-      profiles: profiles.list(), sessions: [...sessions.values()].map(s => s.summary()) });
+    send(ws, { type: 'hello', instanceId, uiVersion, clientId, capabilities: capabilities(local),
+      profiles: profiles.list(), sessions: visibleSessions(local).map(s => s.summary()) });
     const boundaries = new Map<string, number>();
-    for (const s of sessions.values()) {
+    for (const s of visibleSessions(local)) {
       const snapshot = await s.snapshot();
+      if (sessions.get(s.id) !== s) continue;
       boundaries.set(s.id, snapshot.sequence);
       send(ws, { type: 'snapshot', sessionId: s.id, ...snapshot });
       send(ws, { type: 'messages', sessionId: s.id, messages: messages.list(s.id) });
@@ -407,8 +561,8 @@ async function syncBrowser(ws: WebSocket, clientId: string) {
       if (!['output', 'reset', 'resize'].includes(event.type) || event.uiSeq > (boundaries.get(event.sessionId) ?? -1)) send(ws, event);
     }
     if (ws.readyState !== WebSocket.OPEN) return;
-    sockets.add(ws);
-    send(ws, { type: 'synced', sessions: [...sessions.values()].map(s => s.summary()) });
+    sockets.set(ws, local);
+    send(ws, { type: 'synced', sessions: visibleSessions(local).map(s => s.summary()) });
   } finally { synchronizing.delete(ws); }
 }
 
@@ -434,6 +588,10 @@ async function main() {
     await mkdir(DATA, { recursive: true, mode: 0o700 });
     try { await profiles.load(); }
     catch { throw new RuntimeError('无法加载本机服务器配置。请检查配置文件格式和目录权限，修复后重试。'); }
+    if (platform.platform === 'win32') {
+      try { await runConfigs.load(); }
+      catch { throw new RuntimeError('无法加载本机运行配置。请检查 run-configs.json 的格式和目录权限，修复后重试。'); }
+    }
     try { pairing = new Pairing(await loadPairingKey(paths.pairingKey), serviceLock.id); }
     catch { throw new RuntimeError('无法加载配对签名密钥。请检查运行目录的 pairing-key.json。'); }
     const { address, port } = await listenLocal(server, requestedPort);

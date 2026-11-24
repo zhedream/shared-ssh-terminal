@@ -1,8 +1,8 @@
-# 共端：用户与 Agent 的共享 SSH 终端
+# 共端：用户与 Agent 的共享终端
 
-共用同一个真实 SSH 会话：共享画面、独占输入、随时交接。浏览器供用户操作，MCP 供 Agent 操作，双方读取同一份终端画面与最多 2000 行滚动历史。
+共享 SSH 会话或 Windows 本地 PowerShell。浏览器供用户操作，MCP 供 Agent 操作，双方读取同一份终端画面和最多 2000 行滚动历史，并按输入权规则交接。
 
-Windows 和原生 Linux 本机回环均已通过验收。项目尚未选择开源许可证。[文档索引](docs/README.md) · [开发章程](AGENTS.md)
+本文的本地终端和 SSH 启动目录说明适用于当前 Git 功能候选。已发布的 npm `shared-ssh-terminal@0.7.0` 提供 SSH 共享。项目采用 MIT 许可证。[功能范围与验收](docs/local-terminal.md) · [文档索引](docs/README.md) · [开发章程](AGENTS.md) · [MIT 许可证](LICENSE)
 
 ## 操作规则
 
@@ -11,8 +11,8 @@ Windows 和原生 Linux 本机回环均已通过验收。项目尚未选择开�
 - 用户点击「释放输入权」，Agent 调用 `release_control`。空闲时，用户打字或已关联 Agent 请求取锁均可获得输入权。
 - 释放输入权须主动操作。命令输出结束、显示提示符、退格清空输入和暂时没有输出都保持当前锁。
 - 释放和接管只改变输入权，不会结束 `top`、Vim 等程序，也不会清空未发送文字。
-- 先观察实际画面，再发送命令或按键。运行中程序不能当作空闲 Shell。系统不推断命令是否完成，不提供命令退出码。
-- 没有完成检测按钮、初始化脚本、Shell 回调或命令包装。输入通过原 PTY 原样发送，与手工输入相同。
+- 先观察实际画面，再发送命令或按键。运行中的程序继续接收原会话的按键。系统可报告本地终端进程退出码，交互 Shell 内单条命令的完成状态由用户或 Agent 通过画面判断。
+- 共享会话的交互输入通过原 PTY 原样发送。共端不安装命令完成检测或 Shell 回调。
 
 ## 三个独立概念
 
@@ -36,11 +36,22 @@ Windows 10 1809+、Node.js 22/24、系统 OpenSSH。首次部署执行 `npm ci`�
 
 配置和运行状态默认放在 `~/.shared-terminal/`。升级时可用环境变量接续旧配置目录，具体步骤见[本机配置与旧目录](docs/development.md#本机配置与旧目录)。
 
-从本地包安装后使用 `shared-ssh-terminal server` 启动或复用服务，`shared-ssh-terminal status` 查看实际地址与端口，`shared-ssh-terminal mcp` 供 MCP 客户端启动 stdio 适配端。在源码目录构建后，可用 `node dist/cli.js` 加同样的子命令。`stop` 会停止当前运行目录的服务并关闭其所有 SSH 会话。
+从本地包安装后使用 `shared-ssh-terminal server` 启动或复用服务，`shared-ssh-terminal status` 查看实际地址与端口，`shared-ssh-terminal mcp` 供 MCP 客户端启动 stdio 适配端。在源码目录构建后，可用 `node dist/cli.js` 加同样的子命令。`stop` 会停止当前运行目录的服务，结束该实例的 SSH 和本地终端会话。
 
 Linux 本机回环已在非 root 的原生 Linux x86_64 上通过 Node.js 22 和 24 验收。使用 Node CLI 和系统 OpenSSH，运行 `pair` 生成配对链接并手动打开。登录可在终端输入密码或选择本机私钥。已有 Windows 保存密码的配置可保留，另建 Linux 登录配置。[Linux 环境、验收结果与复跑命令](docs/development.md#linux-回环)
 
-本机浏览器可用 `shared-ssh-terminal pair` 重新获取五分钟有效的一次性链接。Windows 主机可配置 HTTPS 监听和证书，随后运行 `shared-ssh-terminal pair --lan`，让同一可信局域网中的浏览器访问。各已配对浏览器共享同一服务的 SSH 会话。[局域网 HTTPS 配置](docs/development.md#局域网-https)
+本机浏览器可用 `shared-ssh-terminal pair` 重新获取五分钟有效的一次性链接。Windows 主机可配置 HTTPS 监听和证书，再运行 `shared-ssh-terminal pair --lan`。已配对的回环和 LAN 浏览器共享同一实例的 SSH 会话。Windows 本地终端与运行配置仅向已配对的回环浏览器及本机 MCP 开放。[局域网 HTTPS 配置](docs/development.md#局域网-https)
+
+### 打开和停止 Windows 本地终端
+
+- 「本地终端 → 打开 PowerShell → 启动」可直接打开本机 shell。「启动目录」留空使用服务用户的主目录，填写时使用存在的绝对路径。
+- 「本地终端 → 运行一次性命令 → 启动」填写启动目录和命令。演示时可用 `Write-Output '共端测试'`，目录填本机已有的测试目录。
+- 「本地终端 → 运行配置 → 添加运行配置」填写名称、启动目录和命令，点击「保存配置」，再从该配置行点击「启动」。正在使用同一配置时会打开已有会话。
+- 选中本地终端页签后，工具栏提供「停止」「强制停止」「重启」和「删除会话」。「停止」先发送 Ctrl+C，等待 8 秒后清理仍在该会话 Job 中的进程。停止保留画面。重启保留页签并清空旧画面，删除会话同时丢弃画面。
+
+### 设置 SSH 启动目录
+
+在「服务器 → 添加服务器／编辑服务器 → 启动目录」保存远端目录。单次覆盖从该服务器的「连接选项 → 本次启动目录 → 连接 ↗」进入。远端目录不存在时，画面提示并继续使用登录目录。该功能依赖远端 POSIX 兼容登录 shell，支持字面空格与引号。[SSH 目录规则](docs/local-terminal.md#推荐方案)
 
 两个输入按钮始终同时展示：
 
@@ -61,13 +72,13 @@ Agent 持锁时可以用 `handoff_to_user` 把运行中的终端交给用户。�
 
 ## 所见即所得、关闭与恢复
 
-- 关闭网页、刷新或网页暂时断线，不结束 SSH；会话由本地服务维护。重新打开恢复保留画面和历史。
+- 关闭网页、刷新或网页暂时断线时，会话由本地服务继续维护。重新打开可恢复同一实例内保留的画面和历史。
 - 关闭 SSH 后，保留页签的历史对用户和已关联 Agent 都只读。用户提供 sessionId 后，也允许只读认领已关闭且未移除的会话。
 - 开启私密后，关闭会话的历史也禁止 Agent 读取。
 - “清空全部历史”同步清空当前屏幕、滚动历史和备用屏幕，用户与 MCP 均不能再读取已清内容；不发送 Shell 清屏命令，不改变锁或私密状态。
 - 清空不能撤回已进入 Agent 聊天上下文的内容，也不能阻止远端将同一内容重新输出。
 - 已关闭页签点击 × 后，所有页面同步移除，服务不再提供该会话的历史；移除活动连接必须先关闭。
-- 双击 `stop.cmd` 停止当前运行目录的本地服务并关闭其所有 SSH。当前页确认服务已更换实例、且旧会话不在新清单中时，会提示旧会话不可恢复。服务器配置仍可使用，从「服务器 → 连接 ↗」建立新 SSH。
+- 双击 `stop.cmd` 停止当前运行目录的本地服务。更换服务实例后，旧 SSH、本地会话和输出均无法恢复。可从「服务器 → 连接 ↗」建立新 SSH，或从「本地终端 → 运行配置 → 启动」手动启动已保存的配置。
 - 页面会检测界面版本，在无待发送输入和编辑弹窗时刷新，保留选中页签。仅刷新网页不会结束 SSH。
 
 ## 保存密码与自动登录
@@ -86,9 +97,11 @@ Agent 持锁时可以用 `handoff_to_user` 把运行中的终端交给用户。�
 
 每个应用启动独立 stdio 适配进程，首次工具调用按同一运行目录查找服务，必要时启动后台实例。既有 `Register-MCP.ps1` 生成的 Codex 登记仍可使用。
 
-同一适配进程发现服务实例已更换后，首次主动调用在提交前返回 `service_instance_changed` 和当前 `instanceId`。用 `list_sessions` 核对当前会话，或用 `create_session` 明确建立新 SSH。短暂断线时会话结局仍需确认。适配进程保留自己的任务身份，但已经发出的输入不会自动重试。
+同一适配进程发现服务实例已更换后，首次主动调用在提交前返回 `service_instance_changed` 和当前 `instanceId`。用 `list_sessions` 核对当前会话。需要继续共享时，可用 `create_session` 明确建立新 SSH，或在支持本地终端的实例手动启动本地会话。短暂断线时会话结局仍需确认。适配进程保留自己的任务身份，已经发出的输入不会自动重试。
 
 同一应用的不同项目或聊天先 `register_agent`，保存 id，后续每次调用传 `agentId`。默认 `list_sessions` 只列出自己的会话；`scope=all` 只列元数据，不授予访问权限。用户会话必须获得用户提供的 sessionId 才能认领。
+
+用户明确要求共享或正在继续已获准的共享任务时，才使用共端。需要新开本地终端时先调用 `get_capabilities` 并确认 `localTerminal` 为 `true`。命名配置复用只返回会话标识和复用状态，后续读屏与输入仍需现有授权。[按需共享和操作路径](skill/usage.md)
 
 | 工具 | 功能 |
 | --- | --- |
@@ -96,7 +109,11 @@ Agent 持锁时可以用 `handoff_to_user` 把运行中的终端交给用户。�
 | `register_agent` | 注册当前项目／聊天任务身份 |
 | `list_profiles` | 列出服务器配置，不包含密码或私钥内容 |
 | `list_sessions` | 列出会话元数据 |
-| `create_session` | 新建关联当前 Agent 的独立 SSH 会话 |
+| `create_session` | 新建当前任务的独立 SSH 会话，可用 `startupDir` 覆盖本次目录 |
+| `get_capabilities` | 查询当前实例是否支持本地终端与保存 SSH 密码 |
+| `list_run_configs` | 列出本机运行配置 |
+| `open_local_shell` / `start_run` | 打开 PowerShell，或运行一次性命令／命名配置 |
+| `stop_session` / `restart_session` | 关联任务凭当前 lease 请求优雅停止或重启本地终端 |
 | `attach_session` | 认领用户明确指定的会话 |
 | `take_control` | 获取空闲或普通用户的输入锁，返回新 lease |
 | `send_input` | 持有效 lease 原样发送命令、文字或控制键 |
@@ -130,6 +147,7 @@ MCP 标准通知只提示有新消息，正文通过任务身份读取；是否�
 - `node node_modules/typescript/bin/tsc`：构建。
 - `node --import tsx --test test/*.test.ts`：权限、唯一锁、显式释放、无注入、私密、保留历史、清空、输入按钮状态和配置导入。
 - `node scripts/e2e.mjs` 运行隔离的 Windows OpenSSH/SSH2/ConPTY/MCP 测试。覆盖密码和密钥登录、真实 Vim 增删改查保存、多页面逐字一致、网页全部离线、多个 Agent 的运行中交接，以及关闭／移除同步。
+- Windows 原生本地终端、运行配置与回环/LAN 的权限分隔由定向夹具验证。[Windows 候选复跑命令](docs/development.md#windows-本地终端回归)
 - `node scripts/linux-e2e.mjs` 在原生 Linux 运行回环验收，覆盖 Unix PTY、密码和私钥、终端缩放后输入及实例重启。[Linux 复跑命令](docs/development.md#原生复跑)
 - `node scripts/shell-smoke.mjs`：本机原始终端测试。设置 `SST_TEST_ZSH` 可同时验证本地 Zsh；不安装任何 Shell 回调。
 

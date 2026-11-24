@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { HandedToUserError, Session, type Pty } from '../src/sessions.js';
+import { HandedToUserError, LocalSession, Session, type Pty } from '../src/sessions.js';
 import { sshArgs, profileSchema, type Profile } from '../src/profiles.js';
 import type { AgentIdentity } from '../src/agents.js';
 
@@ -13,6 +13,28 @@ class FakePty extends EventEmitter implements Pty {
   onData(fn: (s: string) => void) { this.on('data', fn); }
   onExit(fn: (s: { exitCode: number }) => void) { this.on('exit', fn); }
 }
+
+test('restarting a local session fences the old PTY, lease and history cursor', async () => {
+  const old = new FakePty(), current = new FakePty();
+  const session = new LocalSession({ kind: 'local', name: 'fixture', cwd: 'fixture' }, undefined, '', 'browser', agentA);
+  await session.start(async bind => { bind(old); });
+  const lease = session.acceptControl(agentA).lease;
+  old.emit('data', Array.from({ length: 2110 }, (_, i) => 'previous ' + i + '\r\n').join(''));
+  const history = await session.observe('agent:' + agentA.id, 'history', { maxLines: 3 });
+  assert(history.nextCursor);
+  assert.equal(session.summary().historyTruncated, true);
+  old.emit('exit', { exitCode: 0 });
+  await session.restart(async bind => { bind(current); });
+  assert.equal(session.summary().generation, 2);
+  assert.equal(session.summary().historyTruncated, false);
+  old.emit('data', 'old data');
+  old.emit('exit', { exitCode: 99 });
+  assert.equal(session.summary().processState, 'running');
+  assert(!(await session.screen()).text.includes('old data'));
+  assert.throws(() => session.agentInput('old lease', lease, agentA), /锁已失效/);
+  await assert.rejects(session.observe('agent:' + agentA.id, 'history', { cursor: history.nextCursor }), /分页内容已变化/);
+  session.close();
+});
 const profile: Profile = { id: '9af7f0fa-470b-4cb3-9eeb-3960cbf83426', name: 'test', host: '127.0.0.1', port: 22, username: 'user', auth: 'password', note: '' };
 const agentA: AgentIdentity = { id: 'e75da59d-2615-42c5-83f8-cda380154348', name: 'Codex A', application: 'Codex', project: 'project-a' };
 const agentB: AgentIdentity = { ...agentA, id: '53a40cb1-303b-4222-b773-20677723d750', name: 'Cursor B' };

@@ -109,7 +109,7 @@ function mockBrowser(address: string) {
     removeItem(key: string) { storageAccess.push(key); },
   };
   const requests: Array<{ route: string; options: RequestInit; hash: string }> = [];
-  const replies: Array<number | 'offline'> = [];
+  const replies: Array<number | 'offline' | { body: unknown }> = [];
   const timers = new Map<number, { callback: () => void; ms: number }>();
   let timerId = 0;
   const sockets: MockSocket[] = [];
@@ -160,6 +160,7 @@ function mockBrowser(address: string) {
       const reply = replies.shift();
       assert.notEqual(reply, undefined, 'unexpected HTTP request ' + route);
       if (reply === 'offline') throw new Error('Offline');
+      if (typeof reply === 'object') return { status: 200, ok: true, async json() { return reply.body; } };
       return { status: reply, ok: reply !== undefined && reply >= 200 && reply < 300, async json() { return { error: 'unexpected server body' }; } };
     },
   };
@@ -176,6 +177,79 @@ function mockBrowser(address: string) {
     settle: () => new Promise<void>(resolve => setImmediate(resolve)),
   };
 }
+
+test('local terminal sync opens the loopback controls, loads configs and ignores an older generation', async () => {
+  const page = mockBrowser('http://127.0.0.1:43219/');
+  const session = { id: 'local-session', name: 'PowerShell', kind: 'local', cwd: 'C:/test path',
+    status: 'open', processState: 'running', generation: 2, cols: 100, rows: 30 };
+  page.replies.push(204, { body: [{ id: 'config-a', name: 'Run', cwd: 'C:/test path' }] });
+  page.start();
+  await page.settle();
+  const socket = page.sockets[0];
+  socket.open();
+  socket.receive({ type: 'hello', clientId: 'browser', profiles: [], sessions: [session], capabilities: { localTerminal: true } });
+  socket.receive({ type: 'synced', sessions: [session] });
+  await page.settle();
+  assert.equal(page.node('local-launchers').classList.contains('hidden'), false);
+  assert.equal(page.node('run-configs').children.length, 1);
+  assert.match(page.node('local-session-status').textContent, /运行中.*C:\/test path/);
+  assert.equal(page.node('close-session').classList.contains('hidden'), true);
+  socket.receive({ type: 'run-configs', runConfigs: [] });
+  assert.equal(page.node('run-configs').children.length, 0);
+  socket.receive({ type: 'state', session: { ...session, generation: 1, processState: 'exited', status: 'closed' } });
+  socket.receive({ type: 'output', sessionId: session.id, generation: 1, data: 'old output' });
+  assert.match(page.node('local-session-status').textContent, /运行中/);
+  assert.equal(page.displays[0].text, '');
+  page.node('open-local-shell').fire('click');
+  page.node('local-launch-form').fire('submit');
+  const action = JSON.parse(socket.frames.at(-1)!);
+  assert.equal(action.type, 'open-local-shell');
+  assert.equal(Object.hasOwn(action, 'cwd'), false);
+  socket.receive({ type: 'ack', requestId: action.requestId, result: { sessionId: session.id, reused: true } });
+  await page.settle();
+  page.node('run-local-command').fire('click');
+  page.node('local-launch-directory').value = 'C:/missing';
+  page.node('local-launch-command').value = 'Write-Output fixture';
+  page.node('local-launch-form').fire('submit');
+  const start = JSON.parse(socket.frames.at(-1)!);
+  assert.equal(start.type, 'start-run');
+  assert.equal(start.cwd, 'C:/missing');
+  assert.equal(start.command, 'Write-Output fixture');
+  socket.receive({ type: 'error', requestId: start.requestId, error: '启动目录不存在', code: 'invalid_cwd' });
+  await page.settle();
+  assert.equal(page.node('local-launch-status').textContent, '启动目录不存在');
+  assert.equal(page.node('local-launch-submit').disabled, false);
+  socket.receive({ type: 'state', session: { ...session, processState: 'stopped', status: 'closed', forced: true } });
+  assert.match(page.node('local-session-status').textContent, /已停止.*已强制停止/);
+  assert.equal(page.node('stop-local-session').disabled, true);
+  assert.equal(page.node('restart-local-session').disabled, false);
+});
+
+test('LAN and older service capability snapshots hide local controls and leave SSH usable', async () => {
+  for (const capabilities of [{ localTerminal: false, localTerminalUnavailableReason: 'loopback_only' }, undefined]) {
+    const page = mockBrowser('https://192.0.2.10:43219/');
+    const ssh = { id: 'ssh-fixture', name: 'SSH', host: 'fixture', port: 22, status: 'open', cols: 100, rows: 30 };
+    const local = { id: 'local-fixture', kind: 'local', status: 'open', cwd: 'fixture cwd', cols: 100, rows: 30 };
+    page.replies.push(204);
+    page.start();
+    await page.settle();
+    const socket = page.sockets[0];
+    socket.open();
+    socket.receive({ type: 'hello', clientId: 'browser', profiles: [], sessions: [ssh, local], capabilities });
+    socket.receive({ type: 'synced', sessions: [ssh, local] });
+    socket.receive({ type: 'run-configs', runConfigs: [{ name: 'fixture config' }] });
+    socket.receive({ type: 'snapshot', sessionId: local.id, data: 'local output' });
+    socket.receive({ type: 'state', session: local });
+    assert.equal(page.node('local-launchers').classList.contains('hidden'), true);
+    assert.equal(page.node('run-configs').children.length, 0);
+    assert.equal(page.node('tabs').children.length, 1);
+    assert.equal(page.node('close-session').classList.contains('hidden'), false);
+    assert.equal(page.displays.length, 1);
+    assert.deepEqual(page.requests.map(request => request.route), ['/api/auth']);
+    page.node('open-local-shell').fire('click');
+    assert.deepEqual(socket.frames, []);
+  }
+});
 
 test('a launch link removes its fragment before one redemption and waits for Cookie auth and socket sync', async () => {
   const page = mockBrowser('http://127.0.0.1:43219/?view=terminal#pair=mock-link');

@@ -164,8 +164,12 @@ try {
   client = new Client({ name: 'shared-ssh-e2e', version: '1.0.0' }); await client.connect(transport);
   client.setNotificationHandler(LoggingMessageNotificationSchema, notice => { notifications.push(notice.params); });
   const tools = (await client.listTools()).tools.map(t => t.name);
-  assert.equal(tools.length, 16); assert(tools.includes('read_history')); assert(tools.includes('read_messages')); assert(tools.includes('acknowledge_messages'));
-  assert(tools.includes('handoff_to_user')); assert(tools.includes('request_control_return'));
+  for (const tool of [
+    'whoami', 'register_agent', 'list_profiles', 'list_sessions', 'create_session', 'attach_session',
+    'take_control', 'release_control', 'handoff_to_user', 'request_control_return',
+    'read_output', 'read_screen', 'read_history', 'send_input', 'read_messages', 'acknowledge_messages',
+    'get_capabilities', 'list_run_configs', 'open_local_shell', 'start_run', 'stop_session', 'restart_session',
+  ]) assert(tools.includes(tool), `MCP tool missing: ${tool}`);
   for (const obsolete of ['enable_integration', 'execute_command', 'command_status']) assert(!tools.includes(obsolete));
   const html = await (await fetch(agent.url + '/')).text();
   assert(!html.includes('id="share"')); assert(!html.includes('id="integration-status"'));

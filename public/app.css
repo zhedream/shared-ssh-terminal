@@ -67,3 +67,33 @@
   font-size: 12px;
   line-height: 1.6;
 }
+
+.local-launchers {
+  display: grid;
+  gap: 8px;
+  padding-bottom: 14px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+.local-launchers .section-title {
+  padding-bottom: 0;
+}
+.run-configs {
+  max-height: 24vh;
+  overflow: auto;
+}
+.profile-options {
+  width: 100%;
+  margin-top: 6px;
+  font-size: 11px;
+}
+.local-session-status {
+  padding: 7px 20px;
+  border-bottom: 1px solid var(--border);
+  color: #a4b2c4;
+  overflow-wrap: anywhere;
+}
+#local-launch-status, #run-config-status, #ssh-launch-status {
+  color: #f4a4a9;
+  overflow-wrap: anywhere;
+}

@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { WindowsSecrets, type SecretProtector } from './secrets.js';
 
+export const sshStartupDirectory = z.string().min(1).max(2048)
+  .refine(value => value.trim() !== '' && !/[\u0000-\u001f\u007f]/.test(value), '请输入有效的远端启动目录');
 export const profileSchema = z.object({
   id: z.guid().optional(),
   name: z.string().trim().min(1).max(80),
@@ -13,6 +15,7 @@ export const profileSchema = z.object({
   auth: z.enum(['password', 'key', 'agent']).default('password'),
   savePassword: z.boolean().default(false),
   identityFile: z.string().max(2048).optional(),
+  startupDir: sshStartupDirectory.optional(),
   note: z.string().max(500).default('')
 }).strict().superRefine((p, ctx) => {
   if (p.auth === 'key' && (!p.identityFile || !path.isAbsolute(p.identityFile))) {
@@ -103,6 +106,13 @@ export class Profiles {
   }
 }
 
+function sshDirectoryCommand(directory: string) {
+  // OpenSSH passes this as a single command to the remote account shell.
+  const literal = "'" + (directory.startsWith('-') ? './' + directory : directory).replaceAll("'", "'\\''") + "'";
+  return 'CDPATH=; if ! cd ' + literal + ' 2>/dev/null; then ' +
+    "printf '%s\\n' '共端：远端启动目录不可用，继续使用登录目录。' >&2; fi; exec \"${SHELL:-/bin/sh}\" -l";
+}
+
 export function sshArgs(p: Profile, configFile = process.platform === 'win32' ? 'NUL' : '/dev/null', hostKeys: string[] = []) {
   const args = ['-F', configFile, '-tt', '-p', String(p.port), '-l', p.username,
     '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3',
@@ -110,5 +120,6 @@ export function sshArgs(p: Profile, configFile = process.platform === 'win32' ? 
   if (p.auth === 'key') args.push('-i', p.identityFile!, '-o', 'IdentitiesOnly=yes');
   if (p.auth === 'password') args.push('-o', 'PubkeyAuthentication=no', '-o', p.savePassword ? 'PreferredAuthentications=password' : 'PreferredAuthentications=keyboard-interactive,password');
   args.push(...hostKeys, '--', p.host);
+  if (p.startupDir !== undefined) args.push(sshDirectoryCommand(p.startupDir));
   return args;
 }

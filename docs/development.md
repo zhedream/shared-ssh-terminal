@@ -2,7 +2,7 @@
 
 ## 环境
 
-Windows 10 1809+、Node.js 22/24、系统 OpenSSH；保存密码建议使用 OpenSSH 8.6+，依赖 Windows PowerShell 和 DPAPI。前端为原生 JavaScript，无前端构建器。
+Windows SSH 使用 Windows 10 1809+、Node.js 22/24 和系统 OpenSSH。保存密码建议用 OpenSSH 8.6+，并依赖 Windows PowerShell 和 DPAPI。Git 候选的本地终端需支持 ConPTY 的 Windows（当前能力检查要求系统构建号至少 18309），首次启动用系统 Windows PowerShell 编译监督器。前端为原生 JavaScript。
 
 ```powershell
 npm ci
@@ -12,7 +12,7 @@ npm run check:docs
 npm run test:e2e
 ```
 
-`start.cmd` 在首次缺少 CLI 构建产物时先构建，再启动或复用后台服务并打开默认浏览器。源码更新后可先运行 `npm run build`。`stop.cmd` 停止当前运行目录的服务，关闭该实例的所有 SSH。构建文件在 dist，安装依赖在 node_modules，均不提交。
+`start.cmd` 在首次缺少 CLI 构建产物时先构建，再启动或复用后台服务并打开默认浏览器。源码更新后可先运行 `npm run build`。`stop.cmd` 停止当前运行目录的服务，关闭该实例的 SSH 并清理本地会话 Job。构建文件在 dist，安装依赖在 node_modules，均不提交。
 
 <a name="linux-回环候选"></a>
 
@@ -27,6 +27,8 @@ npm run test:e2e
 
 两版均按平台跳过 Windows 局域网双监听和 DPAPI 用例。Linux E2E 从另一个目录通过绝对 CLI 路径验证 `server`、`status`、`pair`、`stop` 和 `mcp`，覆盖手动密码与私钥登录、两路浏览器 WebSocket 同步、PTY 缩放后输入及实例重启。既有 Windows 保存密码配置的编辑被拒，配置和密文保持原样。
 
+上表是既有 SSH 基线的实测。当前 Git 候选的 Linux 原生回归待云端按下节复跑。已更新的 Linux 夹具会核对 HTTP、WS 和 MCP 能力返回 `platform_not_supported`，旧 SSH 仍可连接，并验证保存目录、单次覆盖和缺失目录回退。LAN HTTPS 和原生本地终端首版限 Windows。
+
 日常在本机用 `pair` 输出一次性链接，手动打开浏览器。首次确认主机指纹后，在终端输入密码或使用指定私钥。已有 Windows 保存密码配置仍可在原 Windows 账户使用。在 Linux 的「服务器 → 添加服务器」另建手动登录配置。Linux 仅支持回环，局域网 HTTPS、自动打开默认浏览器和保存密码的本机凭据提供者仍限于现有 Windows 实现。
 
 ### 原生复跑
@@ -36,6 +38,7 @@ npm run test:e2e
 ```bash
 set -e
 for name in ${!SHARED_SSH_LAN_@}; do unset "$name"; done
+git rev-parse HEAD
 uname -srmo
 node --version
 npm --version
@@ -59,7 +62,7 @@ node --import tsx --test test/local-network.test.ts test/service-runtime.test.ts
 
 ## 本机配置与旧目录
 
-默认配置和 known_hosts 位于 `~/.shared-terminal/data/`，实例发现文件、后台日志和 askpass 助手位于 `~/.shared-terminal/runtime/`。`SHARED_SSH_DATA_DIR` 和 `SHARED_SSH_RUNTIME_DIR` 可分别覆盖，相对路径按调用时的工作目录解析。`SHARED_SSH_PORT` 配置首选端口，默认 43127，占用时使用系统分配的端口。一个运行目录对应一个后台实例，配置也应由同一个实例负责写入。
+默认 SSH 配置、known_hosts 和 Windows 本地运行配置 `run-configs.json` 位于 `~/.shared-terminal/data/`。实例发现文件、后台日志、askpass 助手和 Windows Job 监督器位于 `~/.shared-terminal/runtime/`。`SHARED_SSH_DATA_DIR` 和 `SHARED_SSH_RUNTIME_DIR` 可分别覆盖，相对路径按调用时的工作目录解析。`SHARED_SSH_PORT` 配置首选端口，默认 43127，占用时使用系统分配的端口。一个运行目录对应一个后台实例，配置也应由同一个实例负责写入。
 
 升级时，旧项目目录的 `data/` 和 `.runtime/` 留在原处。旧版服务退出后，如需直接使用原配置，可在专用 PowerShell 中运行以下命令，并给 MCP 客户端设置同样的环境。如果要沿用原运行位置，再显式设置 `SHARED_SSH_RUNTIME_DIR` 为旧版 `.runtime` 的绝对路径。已有活动 SSH 时，先安排交接或保存并获得用户授权，再用旧版本的停止入口关闭旧服务。
 
@@ -72,7 +75,7 @@ MCP 客户端可运行 `shared-ssh-terminal mcp`，源码安装也可用 `node` 
 
 ## 服务实例变化与重连
 
-浏览器与本机服务失联时先等待重新同步。原地址持续不可达时，在共端主机运行 `shared-ssh-terminal status`，使用返回的回环地址或 `lan.origin`。收到 401 后使用现有浏览器配对入口。同一实例仍有旧 SSH 时，重新同步即可恢复画面和当前会话状态。当前页确认实例变化且旧会话已不可用时，从「服务器 → 连接 ↗」建立新 SSH。
+浏览器与本机服务失联时先等待重新同步。原地址持续不可达时，在共端主机运行 `shared-ssh-terminal status`，使用返回的回环地址或 `lan.origin`。收到 401 后使用现有浏览器配对入口。同一实例中的 SSH 和本地会话继续运行，重新同步可恢复保留画面和状态。确认实例变化后，从「服务器 → 连接 ↗」建立新 SSH，或在回环页面从「本地终端 → 运行配置 → 启动」手动开本地会话。
 
 同一个 MCP 适配进程首次发现已确认的 `instanceId` 变化时，会在主动操作提交前返回 `service_instance_changed`，结果带当前实例 ID 与说明。下一次可用 `list_sessions` 核对会话，或用 `create_session` 明确建立新 SSH。本机服务暂不可达时仍按连接或启动失败报告。后台仅等候服务，轮询可重新注册原任务和从新实例起点读取消息状态，首次主动调用仍会收到切换提示。新实例只保留原本持久化的配置和凭据，旧会话、终端画面、消息、lease、分页游标和输入不随实例迁移。
 
@@ -110,9 +113,11 @@ Codex 和 Cursor 共用两者都可发现的薄技能。各客户端分别登记
 | `SHARED_SSH_LAN_CERT` | PEM 证书或证书链。首张证书须有效，SAN 须包含浏览器使用的 IP 或 DNS 名 |
 | `SHARED_SSH_LAN_KEY` | 与首张证书匹配的未加密 PEM 私钥文件，存放在仅授权账户可读的位置 |
 
-已有服务会继续使用启动时的配置。变更监听或证书前，请安排活动 SSH 的保存或交接，再停止并启动目标实例。`status` 报告回环地址和可选的 `lan.address`、`lan.port`、`lan.origin`。`pair --lan` 只为该 HTTPS Origin 签发五分钟有效的一次性配对链接。命令 `pair`、`server --open` 和 `start.cmd` 继续打开或签发回环入口。
+已有服务会继续使用启动时的配置。变更监听或证书前，先安排活动会话的保存或交接，再停止并启动目标实例。`status` 报告回环地址和可选的 `lan.address`、`lan.port`、`lan.origin`。`pair --lan` 只为该 HTTPS Origin 签发五分钟有效的一次性配对链接。命令 `pair`、`server --open` 和 `start.cmd` 继续打开或签发回环入口。
 
 局域网浏览器须信任证书并按 `lan.origin` 访问。配对后，Cookie 绑定浏览器主机名和实例，重启后仍可使用有效 Cookie。如果端口发生回退，使用 `status` 公布的新端口访问。只把配对链接交给有权查看及操作这些 SSH 会话的人。管理签发、停止及 MCP 走独立的回环入口。
+
+LAN 配对授权在同一实例查看和操作 SSH。回环上的 Windows 本地会话和运行配置不会进入 LAN 列表、快照或广播。权限由实际监听器、套接字地址和配对决定，代理头不改变访问范围。[服务端门控](architecture.md#配对与监听权限)
 
 ## Windows 旧入口隔离验收
 
@@ -163,14 +168,31 @@ if ($resolvedFixture.StartsWith($fixturePrefix, [StringComparison]::OrdinalIgnor
 | 命令 | 覆盖 |
 | --- | --- |
 | npm run build | TypeScript 类型和输出 |
-| npm test | 本机与局域网端口、发现、配对、HTTP／WS 权限、并发 CLI／MCP 首连与重连、会话及按钮状态。局域网集成测试使用临时证书、OpenSSL 和具体私有 IPv4 接口 |
+| npm test | 端口、发现、配对、会话与按钮、权限、并发、重连。候选含 Windows ConPTY Job 和 LAN 本地功能隔离，用临时证书及具体私有 IPv4 接口 |
 | npm run test:e2e | Windows 本机 OpenSSH/SSH2/ConPTY、密码/密钥/保存密码、真实 Vim、跨页面、多个 MCP 进程、独立消息与标准通知、同实例浏览器重连和服务重启后显式新建 SSH |
-| node scripts/linux-e2e.mjs | 原生 Linux 的回环 CLI、配对、Unix PTY、手动密码/测试私钥、两路 WS/MCP、缩放后输入、进程退出及重启 |
+| node scripts/linux-e2e.mjs | 原生 Linux 的回环 CLI、配对、Unix PTY、手动密码/测试私钥、两路 WS/MCP、缩放后输入、进程退出及重启。候选追加平台能力和 SSH 启动目录断言 |
 | node scripts/shell-smoke.mjs | 本机 Bash 原始输入；设置 SST_TEST_ZSH 可加测 Zsh |
 | npm run check:docs | 所有文档索引和相对引用 |
 | npm run check:publish | Git 暂存版本中的私密目录、主机、本机路径和常见凭据 |
 
 端到端测试使用系统临时目录和动态本机 SSH 端口。Windows E2E 还覆盖首选服务端口被占用时的回退，并使用 Git for Windows 的 Bash／Vim。ConPTY 测试清理时偶尔会出现 node-pty 的 AttachConsole 错误输出，需结合断言与退出码判断。
+
+### Windows 本地终端回归
+
+在独立的候选源码副本运行。准备 Node.js、系统 Windows PowerShell、OpenSSH 和 Git for Windows，双监听测试还使用 OpenSSL 和实际私有 IPv4 接口。浏览器联调使用独立 profile 及临时 data/runtime，可复用[旧入口隔离验收](#windows-旧入口隔离验收)的目录设置。构建完成后保持该副本的 `dist/` 与 `public/` 一致，另一轮构建使用单独目录。
+
+```powershell
+git rev-parse HEAD
+node --version
+npm ci
+npm run build
+node --import tsx --test test/local-terminal.test.ts test/run-configs.test.ts test/sessions.test.ts test/profiles.test.ts test/lan-network.test.ts test/local-network.test.ts
+npm test
+npm run check:docs
+npm run test:e2e
+```
+
+定向用例核对 ConPTY 的工作目录、Job 清理、旧代事件、配置写入和双监听授权。旧 Windows SSH E2E 使用回环 SSH 夹具，按名称核对既有和新增 MCP 工具。Linux 候选使用[原生复跑](#原生复跑)，并按 [SSH 目录兼容范围](local-terminal.md#推荐方案)判断失败。
 
 ## 修改入口
 
@@ -180,8 +202,8 @@ if ($resolvedFixture.StartsWith($fixturePrefix, [StringComparison]::OrdinalIgnor
 
 ## 升级与已知限制
 
-重启服务会断开所有 SSH、清除终端及消息内存；配置和密码密文仍留本机。有活动连接先告知用户并获得授权。增加 MCP 工具后，客户端可能需要重新加载 MCP 或重启应用才能刷新工具目录。
+重启服务会断开该实例的 SSH、停止本地终端 Job，并清除会话、画面和消息。SSH 配置、密码密文和命名运行配置仍留本机。有活动会话时先告知用户并取得授权。增加 MCP 工具后，客户端可能需要重新加载 MCP 或重启应用才能刷新工具目录。
 
 当前网页资产从磁盘读取，uiVersion 在服务启动时计算。开发时修改 public 但暂不重启，可能让旧服务临时返回新页面；上线应在测试后及时加载同一版本，并在旧客户端不能自动同步时刷新页面。未来可以改为资产快照或版本目录，此项尚未实现。
 
-默认未指定开源许可证；公开前由仓库所有者决定。不要把私有仓库误称为已经开源发布。
+项目采用 [MIT 许可证](../LICENSE)。Git 候选功能与已发布 npm 版本的范围见[本地终端状态](local-terminal.md)。

@@ -1,6 +1,9 @@
 import { McpServer, type ToolCallback } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { sshStartupDirectory } from './profiles.js';
+import { LocalTerminalError } from './local-terminal.js';
+import { openLocalInput, startRunInput } from './run-configs.js';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { AgentIdentity } from './agents.js';
@@ -93,11 +96,14 @@ async function request(action: string, args: Record<string, unknown>, watchConne
       const response = await fetch(new URL('/agent', connection.url), {
         method: 'POST', headers: { Authorization: `Bearer ${connection.agentToken}`, 'Content-Type': 'application/json', Connection: 'close',
           'X-Agent-Id': context.identity.id, 'X-Agent-Token': context.secret },
-        body: JSON.stringify(value), signal: AbortSignal.any([AbortSignal.timeout(20000), shutdown.signal]), redirect: 'error'
+        body: JSON.stringify(value), signal: AbortSignal.any([AbortSignal.timeout(action === 'restart_session' ? 30000 : 20000), shutdown.signal]), redirect: 'error'
       });
       const result = await response.json();
       if (!response.ok) {
         if (result.code === 'handed_to_user') throw new HandoffPending(result.error);
+        if (['local_terminal_unavailable', 'invalid_cwd', 'local_start_failed', 'start_conflict', 'lifecycle_conflict'].includes(result.code)) {
+          throw new LocalTerminalError(result.code, result.error);
+        }
         throw new RuntimeError(result.error || '共享终端请求失败');
       }
       unreadCount = Number(response.headers.get('X-Shared-Ssh-Unread-Count') || 0);
@@ -125,6 +131,9 @@ async function request(action: string, args: Record<string, unknown>, watchConne
     }
     return { content };
   } catch (e) {
+    if (e instanceof LocalTerminalError) {
+      return { isError: true, structuredContent: { code: e.code, error: e.message }, content: [{ type: 'text' as const, text: e.message }] };
+    }
     if (e instanceof HandoffPending || e instanceof ServiceInstanceChanged) {
       const details = e instanceof ServiceInstanceChanged
         ? { code: 'service_instance_changed', instanceId: e.instanceId, error: e.message }
@@ -136,7 +145,7 @@ async function request(action: string, args: Record<string, unknown>, watchConne
   }
 }
 const agentId = z.guid().optional().describe('register_agent 返回的任务身份 ID；同一任务后续每次调用都携带此 ID。不传时使用当前 MCP 进程默认身份。');
-const sessionId = z.guid().describe('SSH 页签唯一 ID；不能使用 Host 替代，不得按相同服务器猜测或复用他人的会话。');
+const sessionId = z.guid().describe('共端会话唯一 ID；不能使用 Host 替代，不得按相同服务器猜测或复用他人的会话。');
 const waitMs = z.number().int().min(0).max(15000).optional().describe('最多等待毫秒数；等待超时不会释放锁或重新执行命令');
 const readLimits = {
   maxChars: z.number().int().min(128).max(16000).optional().describe('文本字符硬上限，默认 4000；不含 JSON 元数据，不是精确 Token 数。'),
@@ -157,8 +166,14 @@ registerTool('register_agent', { description: '为当前项目/聊天注册独�
   const context = newContext(args.name, args.project, args.task); return request('whoami', { agentId: context.identity.id });
 });
 registerTool('list_profiles', { description: '列出共用 SSH 服务器配置，不包含密码、私钥内容。相同配置不代表相同 SSH 会话。', inputSchema: { agentId } }, args => request('list_profiles', args));
+registerTool('get_capabilities', { description: '查看当前回环实例是否支持 Windows 本地终端与保存 SSH 密码。', inputSchema: { agentId } }, args => request('get_capabilities', args));
+registerTool('list_run_configs', { description: '列出本机命名运行配置。仅在用户明确要求共享或继续当前共享任务时使用。', inputSchema: { agentId } }, args => request('list_run_configs', args));
+registerTool('open_local_shell', { description: '在共端所在 Windows 主机共享 PowerShell。仅在用户明确要求共享时使用。省略 cwd 使用服务用户的主目录。', inputSchema: { agentId, ...openLocalInput } }, args => request('open_local_shell', args));
+registerTool('start_run', { description: '在已明确共享的任务中按 configId 启动命名配置，或用 cwd 和 command 启动一次性 PowerShell 命令，二选一。复用不会授予关联或操作权限。', inputSchema: { agentId, ...startRunInput } }, args => request('start_run', args));
+registerTool('stop_session', { description: '持当前 lease 的关联任务可请求优雅停止本地终端。画面和会话保留。', inputSchema: { agentId, sessionId, lease: z.guid() } }, args => request('stop_session', args));
+registerTool('restart_session', { description: '持当前 lease 的关联任务可优雅停止并按原参数重启本地终端。重启更换进程一代并清空旧画面，需要重新取锁。', inputSchema: { agentId, sessionId, lease: z.guid() } }, args => request('restart_session', args));
 registerTool('list_sessions', { description: '默认只列出归属当前 Agent 的页签。scope=all 仅查看全部会话元数据及创建来源、归属、具体操作者，不授予读写权限。用户创建且待交接的会话不属于任何 Agent。', inputSchema: { agentId, scope: z.enum(['mine', 'all']).optional() } }, args => request('list_sessions', args));
-registerTool('create_session', { description: '使用配置新建关联当前 Agent 的独立 SSH 页签，默认非私密、输入锁空闲。保存 sessionId 并读取画面；无需完成检测或 Shell 初始化。Agent 观察画面后获取输入权，通过 send_input 直接操作，结束本次操作后主动 release_control。若停在密码、密钥口令或主机确认提示，等待用户在界面处理，不得发送密码。不能因 Host 相同复用其他页签。', inputSchema: { agentId, profileId: z.guid() } }, args => request('create_session', args));
+registerTool('create_session', { description: '使用配置新建关联当前 Agent 的独立 SSH 页签，默认非私密、输入锁空闲。保存 sessionId 并读取画面；无需完成检测或 Shell 初始化。Agent 观察画面后获取输入权，通过 send_input 直接操作，结束本次操作后主动 release_control。若停在密码、密钥口令或主机确认提示，等待用户在界面处理，不得发送密码。不能因 Host 相同复用其他页签。', inputSchema: { agentId, profileId: z.guid(), startupDir: sshStartupDirectory.optional() } }, args => request('create_session', args));
 registerTool('attach_session', { description: '仅在用户明确提供 sessionId 时认领原 SSH 页签，不重新连接。已关闭但保留页签的会话可只读认领历史，不能再输入。用户运行 top/vim 或正在输入时也可认领观察，输入权仍在用户手中。另一 Agent 持锁时需用户先接管。私密模式不能认领。', inputSchema: { agentId, sessionId } }, args => request('attach_session', args));
 registerTool('take_control', { description: '为当前关联任务获取空闲输入锁或接管普通用户锁，返回新 lease。已有 Agent 持锁、私密或人工交接时拒绝。人工交接返回 handed_to_user，须等待用户交回。先观察画面，继续操作原程序。', inputSchema: { agentId, sessionId } }, args => request('take_control', args));
 registerTool('release_control', { description: '释放当前 Agent 持有的输入锁，必须提供有效 lease。不解除 Agent 关联，不终止运行中的程序，不清空历史或未发送输入。释放后用户页面或获授权的 Agent 可获取锁。', inputSchema: { agentId, sessionId, lease: z.guid() } }, args => request('release_control', args));

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
+import { generateKeyPairSync, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { request } from 'node:https';
@@ -8,9 +9,13 @@ import { createServer } from 'node:net';
 import { networkInterfaces, tmpdir } from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { WebSocket } from 'ws';
+import ssh2 from 'ssh2';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { loadLanConfiguration, type LanDiscovery } from '../src/lan-network.js';
 import { installRoot, servicePaths } from '../src/paths.js';
 
@@ -71,8 +76,8 @@ test('Linux refuses LAN configuration before publishing a ready instance', {
   for (const file of [paths.connection, paths.ui, paths.owner]) await assert.rejects(access(file), { code: 'ENOENT' });
 });
 
-test('Windows listeners share browser state and keep LAN pairing, TLS and administration separate', {
-  skip: process.platform !== 'win32', timeout: 50000,
+test('Windows listeners share SSH while excluding all local terminal data from paired LAN', {
+  skip: process.platform !== 'win32', timeout: 85000,
 }, async t => {
   const interfaces = Object.values(networkInterfaces()).flatMap(value => value ?? []);
   const address = interfaces.find(item => item.family === 'IPv4' && !item.internal &&
@@ -155,9 +160,36 @@ test('Windows listeners share browser state and keep LAN pairing, TLS and admini
   assert.equal((await tlsHttp('/api/auth', { headers: { Cookie: localCookie } })).status, 401);
   assert.equal((await tlsHttp('/api/auth', { headers: { Cookie: lanCookie } })).status, 204);
   assert.equal((await tlsHttp('/api/profiles', { method: 'POST', headers: { Cookie: lanCookie }, body: '{}' })).status, 403);
+  const hostKeys = [generateKeyPairSync('rsa', { modulusLength: 2048, privateKeyEncoding: { type: 'pkcs1', format: 'pem' }, publicKeyEncoding: { type: 'pkcs1', format: 'pem' } }).privateKey];
+  const connections = new Set<ssh2.Connection>();
+  const remoteCommands: string[] = [];
+  const ssh = new ssh2.Server({ hostKeys }, connection => {
+    connections.add(connection);
+    connection.on('error', () => {});
+    connection.once('close', () => connections.delete(connection));
+    connection.on('authentication', context => context.accept());
+    connection.on('ready', () => connection.on('session', accept => {
+      const session = accept();
+      session.on('pty', accept => accept?.());
+      session.on('shell', accept => { const stream = accept(); stream.write('LAN SSH FIXTURE\r\n'); stream.on('data', data => stream.write(data)); });
+      session.on('exec', (accept, _reject, info) => {
+        remoteCommands.push(info.command);
+        const stream = accept(); stream.write('LAN SSH DIRECTORY FIXTURE\r\n'); stream.on('data', data => stream.write(data));
+      });
+    }));
+  });
+  ssh.listen(0, '127.0.0.1');
+  await once(ssh, 'listening');
+  t.after(async () => {
+    for (const connection of connections) connection.end();
+    await new Promise<void>(resolve => ssh.close(() => resolve()));
+  });
+  const sshAddress = ssh.address();
+  assert(sshAddress && typeof sshAddress !== 'string');
   const created = await fetch(local + '/api/profiles', { method: 'POST', headers: { Cookie: localCookie, Origin: local, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'Shared LAN fixture', host: '127.0.0.1', username: 'fixture', auth: 'password', port: 22 }) });
+    body: JSON.stringify({ name: 'Shared LAN fixture', host: '127.0.0.1', username: 'fixture', auth: 'password', port: sshAddress.port }) });
   assert.equal(created.status, 200);
+  const profile = await created.json();
   const synced = ws({ Origin: first.lan.origin, Cookie: lanCookie });
   try {
     const hello = JSON.parse((await once(synced, 'message'))[0].toString());
@@ -166,6 +198,141 @@ test('Windows listeners share browser state and keep LAN pairing, TLS and admini
   } finally { synced.terminate(); }
   const crossOrigin = ws({ Origin: local, Cookie: lanCookie });
   try { await assert.rejects(once(crossOrigin, 'open'), /socket hang up/); } finally { crossOrigin.terminate(); }
+
+  async function browser(socket: WebSocket) {
+    const frames: any[] = [];
+    socket.on('message', raw => frames.push(JSON.parse(raw.toString())));
+    socket.on('error', () => {});
+    t.after(() => socket.terminate());
+    const find = async (predicate: (packet: any) => boolean) => {
+      const deadline = Date.now() + 18000;
+      do {
+        const packet = frames.find(predicate);
+        if (packet) return packet;
+        await delay(30);
+      } while (Date.now() < deadline);
+      throw new Error('Expected WS frame not received');
+    };
+    const rpc = (type: string, data: Record<string, unknown> = {}) => {
+      const requestId = randomUUID();
+      socket.send(JSON.stringify({ type, requestId, ...data }));
+      return find(packet => packet.requestId === requestId);
+    };
+    await find(packet => packet.type === 'synced');
+    return { frames, find, rpc };
+  }
+  const lanHeaders = { Origin: first.lan.origin, Cookie: lanCookie, 'X-Forwarded-For': '127.0.0.1' };
+  const [lanBrowser, localBrowser] = await Promise.all([
+    browser(ws(lanHeaders)),
+    browser(new WebSocket(local.replace('http:', 'ws:') + '/terminal', { headers: { Origin: local, Cookie: localCookie } })),
+  ]);
+  assert.equal(lanBrowser.frames[0].capabilities.localTerminal, false);
+  assert.equal(lanBrowser.frames[0].capabilities.localTerminalUnavailableReason, 'loopback_only');
+  assert.equal(localBrowser.frames[0].capabilities.localTerminal, true);
+  assert.equal((await lanBrowser.rpc('open-local-shell')).code, 'local_terminal_unavailable');
+  assert.equal((await tlsHttp('/api/run-configs', { headers: lanHeaders })).status, 404);
+  const invalid = await localBrowser.rpc('open-local-shell', { cwd: path.join(directory, 'absent fixture') });
+  assert.equal(invalid.code, 'invalid_cwd');
+  const main = await localBrowser.rpc('open-local-shell', { cwd: directory, startKey: 'local-fixture' });
+  assert.equal(main.type, 'ack');
+  const { sessionId } = main.result;
+  const again = await localBrowser.rpc('open-local-shell', { cwd: directory, startKey: 'local-fixture' });
+  assert.deepEqual(again.result, { sessionId, reused: true });
+  assert.equal((await localBrowser.rpc('takeover', { sessionId })).type, 'ack');
+  const state = localBrowser.frames.filter(frame => frame.type === 'state' && frame.session.id === sessionId).at(-1).session;
+  assert.equal((await localBrowser.rpc('input', { sessionId, revision: state.revision, data: "Write-Output ('LOCAL_' + 'PROBE')\r" })).type, 'ack');
+  await localBrowser.find(frame => frame.type === 'output' && frame.sessionId === sessionId && frame.data.includes('LOCAL_PROBE'));
+  assert.equal((await localBrowser.rpc('read-history', { sessionId })).type, 'ack');
+  for (const action of ['read-history', 'input', 'takeover', 'clear-history']) {
+    const denied = await lanBrowser.rpc(action, { sessionId, data: 'fixture', revision: 0 });
+    const absent = await lanBrowser.rpc(action, { sessionId: randomUUID(), data: 'fixture', revision: 0 });
+    assert.deepEqual([denied.type, denied.error, denied.code], [absent.type, absent.error, absent.code]);
+    assert.equal(denied.code, 'session_not_found');
+  }
+  for (const id of [sessionId, randomUUID()]) {
+    assert.deepEqual((await lanBrowser.rpc('dismiss-tab', { sessionId: id })).result, { ok: true });
+  }
+  const save = await fetch(local + '/api/run-configs', { method: 'POST',
+    headers: { Origin: local, Cookie: localCookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'isolated command', cwd: directory, command: 'Start-Sleep -Seconds 60' }) });
+  assert.equal(save.status, 200);
+  const { id: configId } = await save.json();
+  const runConfigs = await (await fetch(local + '/api/run-configs', { headers: { Cookie: localCookie } })).json();
+  assert.equal(runConfigs[0].id, configId);
+  await localBrowser.find(frame => frame.type === 'run-configs' && frame.runConfigs.some((row: any) => row.id === configId));
+  const localNew = await browser(new WebSocket(local.replace('http:', 'ws:') + '/terminal', { headers: { Origin: local, Cookie: localCookie } }));
+  const starts = await Promise.all([localBrowser.rpc('start-run', { configId }), localNew.rpc('start-run', { configId })]);
+  assert.equal(starts[0].result.sessionId, starts[1].result.sessionId);
+  assert.deepEqual(starts.map(frame => frame.result.reused).sort(), [false, true]);
+  const lanState = await tlsHttp('/api/state', { headers: lanHeaders });
+  assert(!lanState.body.includes(sessionId) && !lanState.body.includes(configId));
+  const lateLan = await browser(ws(lanHeaders));
+  assert(!JSON.stringify(lateLan.frames).includes(sessionId));
+  assert(!JSON.stringify(lanBrowser.frames).includes(configId));
+  assert(!lanBrowser.frames.some(frame => frame.sessionId === sessionId || frame.session?.id === sessionId || frame.type === 'run-configs'));
+
+  const client = new Client({ name: 'isolated LAN boundary test', version: '0.0.1' });
+  const transport = new StdioClientTransport({ command: process.execPath,
+    args: ['--import', tsx, path.join(installRoot, 'src/cli.ts'), 'mcp'], cwd: directory,
+    env: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined)), stderr: 'pipe' });
+  transport.stderr?.resume();
+  t.after(() => client.close());
+  await client.connect(transport);
+  const invokeTool = (name: string, args: Record<string, unknown> = {}) => client.callTool({ name, arguments: args });
+  const call = async (name: string, args?: Record<string, unknown>) => {
+    const result = await invokeTool(name, args);
+    assert.equal(result.isError, undefined);
+    assert(Array.isArray(result.content) && result.content[0]?.type === 'text');
+    return JSON.parse(result.content[0].text);
+  };
+  assert.equal((await call('get_capabilities')).localTerminal, true);
+  assert.equal((await call('list_run_configs'))[0].id, configId);
+  assert.deepEqual(await call('start_run', { configId }), { sessionId: starts[0].result.sessionId, reused: true });
+  const visible = (await call('list_sessions', { scope: 'all' })).find((row: any) => row.id === sessionId);
+  assert.equal(visible.cwd, undefined);
+  assert.equal(visible.isMine, false);
+  assert.equal((await invokeTool('read_screen', { sessionId })).isError, true);
+  await call('attach_session', { sessionId });
+  const screen = await call('read_screen', { sessionId });
+  assert(screen.lines.some((line: any) => line.text.includes('LOCAL_PROBE')));
+  const lease = (await call('take_control', { sessionId })).lease;
+  assert.equal((await invokeTool('stop_session', { sessionId, lease: randomUUID() })).isError, true);
+  await call('handoff_to_user', { sessionId, lease });
+  assert.equal((await invokeTool('stop_session', { sessionId, lease })).structuredContent?.code, 'handed_to_user');
+  assert.equal((await localBrowser.rpc('privacy', { sessionId, privateMode: true })).type, 'ack');
+  assert.equal((await invokeTool('read_screen', { sessionId })).isError, true);
+  assert.equal((await invokeTool('restart_session', { sessionId, lease })).isError, true);
+  await client.close();
+
+  assert.equal((await localBrowser.rpc('stop-session', { sessionId, mode: 'force' })).result.processState, 'stopped');
+  assert.equal((await localBrowser.rpc('delete-session', { sessionId })).type, 'ack');
+  assert.equal((await localBrowser.rpc('stop-session', { sessionId: starts[0].result.sessionId, mode: 'force' })).type, 'ack');
+
+  const lanSsh = await lanBrowser.rpc('create', { profileId: profile.id });
+  assert.equal(lanSsh.type, 'ack');
+  assert.equal(lanSsh.result.kind, 'ssh');
+  const sshId = lanSsh.result.id;
+  await lanBrowser.find(frame => frame.type === 'output' && frame.sessionId === sshId && frame.data.includes('fingerprint'));
+  assert.equal((await lanBrowser.rpc('input', { sessionId: sshId, revision: lanSsh.result.revision, data: 'yes\r' })).type, 'ack');
+  await lanBrowser.find(frame => frame.type === 'output' && frame.sessionId === sshId && frame.data.includes('LAN SSH FIXTURE'));
+  assert.equal((await lanBrowser.rpc('read-history', { sessionId: sshId })).type, 'ack');
+  assert.equal((await lanBrowser.rpc('takeover', { sessionId: sshId })).type, 'ack');
+  assert.equal((await lanBrowser.rpc('close', { sessionId: sshId })).type, 'ack');
+  await lanBrowser.find(frame => frame.type === 'exit' && frame.sessionId === sshId);
+  const savedDirectory = "saved directory's literal";
+  const edit = await fetch(local + '/api/profiles', { method: 'POST',
+    headers: { Origin: local, Cookie: localCookie, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...profile, startupDir: savedDirectory }) });
+  assert.equal(edit.status, 200);
+  for (const startupDir of [undefined, '-one-time directory']) {
+    const opened = await lanBrowser.rpc('create', { profileId: profile.id, startupDir });
+    const remoteId = opened.result.id;
+    assert.equal(opened.result.startupDir, startupDir ?? savedDirectory);
+    await lanBrowser.find(frame => frame.type === 'output' && frame.sessionId === remoteId && frame.data.includes('SSH DIRECTORY FIXTURE'));
+    assert.equal((await lanBrowser.rpc('close', { sessionId: remoteId })).type, 'ack');
+  }
+  assert.match(remoteCommands[0], /saved directory.*literal/);
+  assert(remoteCommands[1].includes('./-one-time directory'));
 
   const { adminToken } = JSON.parse(await readFile(paths.ui, 'utf8'));
   const { agentToken } = JSON.parse(await readFile(paths.connection, 'utf8'));

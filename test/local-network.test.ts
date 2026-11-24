@@ -85,11 +85,12 @@ async function startService(t: TestContext, preferredPort?: number, blockDiscove
   return { discover, data, runtime, closed, stderr: () => stderr };
 }
 
+type BrowserCapabilities = { savePassword: boolean; localTerminal: boolean; localTerminalUnavailableReason?: string };
 async function wsSynced(authority: string, cookie: string) {
   const ws = new WebSocket(`ws://${authority}/terminal`, { origin: `http://${authority}`, headers: { cookie }, handshakeTimeout: 3000 });
   try {
-    const synced = new Promise<{ instanceId: string; capabilities: { savePassword: boolean } } | undefined>((resolve, reject) => {
-      let hello: { instanceId: string; capabilities: { savePassword: boolean } } | undefined;
+    const synced = new Promise<{ instanceId: string; capabilities: BrowserCapabilities } | undefined>((resolve, reject) => {
+      let hello: { instanceId: string; capabilities: BrowserCapabilities } | undefined;
       ws.on('message', raw => {
         const message = JSON.parse(raw.toString());
         if (message.type === 'hello') hello = { instanceId: message.instanceId, capabilities: message.capabilities };
@@ -156,8 +157,13 @@ test('port collision publishes a usable address for UI, WS and the original MCP 
     const redeemed = await fetch(origin + '/api/pair', { method: 'POST', headers: { origin, 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) });
     assert.equal(redeemed.status, 204);
     const cookie = redeemed.headers.get('set-cookie')!.split(';')[0];
-    assert.equal(await status(`${origin}/api/state`, { cookie }), 200);
-    const expected = { instanceId, capabilities: { savePassword: process.platform === 'win32' } };
+    const state = await fetch(`${origin}/api/state`, { headers: { cookie } });
+    assert.equal(state.status, 200);
+    const windows = process.platform === 'win32';
+    const capabilities = { savePassword: windows, localTerminal: windows,
+      ...(windows ? {} : { localTerminalUnavailableReason: 'platform_not_supported' }) };
+    assert.deepEqual((await state.json()).capabilities, capabilities);
+    const expected = { instanceId, capabilities };
     assert.deepEqual(await wsSynced(authority, cookie), expected);
     assert.deepEqual(await wsSynced(authority, cookie), expected);
   }
